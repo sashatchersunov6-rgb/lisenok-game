@@ -1,0 +1,1479 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Лисёнок и огненный жёлудь</title>
+<style>html,body{margin:0;height:100%;background:#0b0f14;overflow:hidden}canvas{display:block;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(100vw,calc(100vh*16/9));height:min(100vh,calc(100vw*9/16));touch-action:none}</style>
+</head><body><canvas id="game" width="1280" height="720"></canvas>
+<script>
+// ================= ЧАСТЬ 1: ЯДРО ИГРЫ «Лисёнок и огненный жёлудь» =================
+// ---------- 1. Константы и настройки ----------
+const canvas = document.getElementById('game'), ctx = canvas.getContext('2d');
+const W = 1280, H = 720, TILE = 48, ROWS = 15, DT = 1 / 60, LEVEL_TIME = 300;
+const HERO_W = 30, HERO_SMALL = 42, HERO_BIG = 84;
+const PHYS = { walk: 260, run: 430, acc: 1500, airAcc: 1100, fric: 1700, skid: 3000,
+  jump: 920, grav: 2300, cut: 2.6, maxFall: 960, coyote: 0.1, buffer: 0.12 };
+const T = { EMPTY: 0, GROUND: 1, BRICK: 2, Q: 3, USED: 4, STONE: 5, STUMP: 6, HIDDEN: 7 };
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const sign = v => v > 0 ? 1 : v < 0 ? -1 : 0;
+function sfx(name) { if (typeof playSfx === 'function') playSfx(name); } // звук — часть 4
+
+// ---------- 2. Карта уровня ----------
+// . пусто  # земля  X камень  B кирпич  ? монета  M бонус (жёлудь/цветок)  T 10 монет  S звезда
+// L скрытая жизнь  P пень  o монета  b жук  s улитка  h ёж  f хищный цветок (над пнём)
+// - платформа ↔  ^ платформа ↕  C чекпоинт  F флаг  D вход в пещеру  E выход из пещеры
+// I точка появления в пещере  O пень-выход в пещере. Строки зон выравниваются по низу (15 рядов).
+const ZONE_A = [ // солнечная поляна
+  '......................?................................',
+  '.......................................................',
+  '.......................................................',
+  '.......................................................',
+  '............?.......BMB?B.......................L......',
+  '.......ooo..........................PP......PP.........',
+  '............................PP......PP......PP.........',
+  '..................b.........PP...b..PP..b.b.PP.........',
+  '###################################################..##',
+  '###################################################..##'];
+const ZONE_B = [ // лес с пнями
+  '........................BBSBB..........................',
+  '.......................................................',
+  '.......................................................',
+  '..................................o....................',
+  '....BTB..............D...?M?.....o.o..........E........',
+  '.............f.......PP...............f.......PP.......',
+  '.............PP......PP...............PP......PP.......',
+  '.........s...PP..b.b.PP.......h.......PP..s.b.PP..C....',
+  '#################################...###################',
+  '#################################...###################'];
+const ZONE_C = [ // обрыв с платформами
+  '...........ooo...............................ooo.......',
+  '.......X.............?M?............B?BB...............',
+  '......XX.-.............................................',
+  '.....XXX...................................-...........',
+  '....XXXX............h....s...^......b.b................',
+  '########.........###########......########.........####',
+  '########.........###########......########.........####'];
+const ZONE_D = [ // вечерний холм с финишем
+  '....................?....................XX............',
+  '........................................XXX............',
+  '.......................................XXXX............',
+  '......................................XXXXX............',
+  '...?B?.........f...BMB...............XXXXXX............',
+  '...............PP...................XXXXXXX............',
+  '...............PP..................XXXXXXXX............',
+  '......s........PP.h.........b.b.s.XXXXXXXXX....F.......',
+  '##########...#########....#############################',
+  '##########...#########....#############################'];
+const CAVE = [ // бонусная пещера
+  '############################',
+  '#.I........................#',
+  '#..........................#',
+  '#..........................#',
+  '#..........................#',
+  '#..........................#',
+  '#..........................#',
+  '#..........................#',
+  '#.......oooooooooo.........#',
+  '#.......oooooooooo.....O...#',
+  '#......BBBBBBBBBBBB....PP..#',
+  '#......................PP..#',
+  '#.......oooooooooo.....PP..#',
+  '############################',
+  '############################'];
+const ZONES = [ZONE_A, ZONE_B, ZONE_C, ZONE_D];
+const ZONE_W = 55, MAIN_W = ZONE_W * 4, CAVE_X = MAIN_W + 4, CAVE_W = 28, LW = CAVE_X + CAVE_W;
+
+// ---------- 3. Мир: массивы и состояние игры ----------
+const tiles = new Uint8Array(LW * ROWS);
+const blocks = new Map(); // содержимое блоков: ключ tx+ty*LW -> {item:'coin'|'power'|'multi'|'star'|'life', n}
+const enemies = [], items = [], fireballs = [], particles = [], platforms = [], floatTexts = [];
+let checkpoint = { x: 0, y: 0, active: false };
+let flag = { x: 0, topY: 0, baseY: 0, houseX: 0 };
+let warp = { enter: null, exit: null, caveIn: null, caveOut: null };
+const area = { name: 'main', x0: 0, x1: MAIN_W * TILE };
+const cam = { x: 0, y: 0, look: 0 };
+const game = { mode: 'menu', modeT: 0, frame: 0, score: 0, coins: 0, lives: 3, time: LEVEL_TIME,
+  checkpoint: false, muted: false, demo: false, hiscore: 0, shake: 0, fade: 1, timeBonus: 0, flagBonus: 0 };
+try { game.hiscore = +localStorage.getItem('foxAcornHi') || 0; } catch (e) { /* без хранилища */ }
+function saveHiscore() {
+  if (game.score <= game.hiscore) return false;
+  game.hiscore = game.score;
+  try { localStorage.setItem('foxAcornHi', String(game.hiscore)); } catch (e) { /* без хранилища */ }
+  return true;
+}
+const hero = { power: 0 }; // power: 0 маленький, 1 большой, 2 огненный
+
+// ---------- 4. Тайлы и разбор карты ----------
+const bkey = (tx, ty) => tx + ty * LW;
+function tileAt(tx, ty) {
+  if (ty < 0 || ty >= ROWS) return T.EMPTY;
+  if (tx < 0 || tx >= LW) return T.STONE;
+  return tiles[ty * LW + tx];
+}
+function setTile(tx, ty, t) { if (tx >= 0 && tx < LW && ty >= 0 && ty < ROWS) tiles[ty * LW + tx] = t; }
+function solidAt(tx, ty) { const t = tileAt(tx, ty); return t !== T.EMPTY && t !== T.HIDDEN; }
+function zoneOf(x) { return x >= CAVE_X * TILE ? 4 : clamp(Math.floor(x / (ZONE_W * TILE)), 0, 3); }
+function makeEnemy(type, cx, by) { // cx — центр по X, by — низ
+  const S = { beetle: [40, 36, 60], snail: [42, 38, 45], hedgehog: [44, 36, 50], flower: [40, 60, 0] }[type];
+  return { type, x: cx - S[0] / 2, y: by - S[1], w: S[0], h: S[1], speed: S[2], vx: 0, vy: 0, dir: -1,
+    state: type === 'flower' ? 'hide' : 'walk', t: Math.random() * 3, baseY: by, rise: 0,
+    alive: true, active: false, onGround: false, wall: 0, head: null };
+}
+function makePlatform(tx, ty, axis) {
+  return { x: tx * TILE, y: ty * TILE + 6, w: TILE * 3, h: 20, x0: tx * TILE, y0: ty * TILE + 6, axis,
+    range: axis === 'h' ? TILE * 5 : TILE * 4, t: 0, dx: 0, dy: 0 }; // 'h': вправо на range, 'v': вверх на range
+}
+function parseCell(ch, tx, ty) {
+  const px = tx * TILE, py = ty * TILE, k = bkey(tx, ty);
+  switch (ch) {
+    case '#': setTile(tx, ty, T.GROUND); break;
+    case 'X': setTile(tx, ty, T.STONE); break;
+    case 'P': setTile(tx, ty, T.STUMP); break;
+    case 'B': setTile(tx, ty, T.BRICK); break;
+    case '?': setTile(tx, ty, T.Q); blocks.set(k, { item: 'coin' }); break;
+    case 'M': setTile(tx, ty, T.Q); blocks.set(k, { item: 'power' }); break;
+    case 'T': setTile(tx, ty, T.BRICK); blocks.set(k, { item: 'multi', n: 10 }); break;
+    case 'S': setTile(tx, ty, T.BRICK); blocks.set(k, { item: 'star' }); break;
+    case 'L': setTile(tx, ty, T.HIDDEN); blocks.set(k, { item: 'life' }); break;
+    case 'o': items.push({ type: 'coin', x: px + 12, y: py + 8, w: 24, h: 32, vx: 0, vy: 0, fixed: true, t: tx * 0.3 }); break;
+    case 'b': enemies.push(makeEnemy('beetle', px + 24, py + TILE)); break;
+    case 's': enemies.push(makeEnemy('snail', px + 24, py + TILE)); break;
+    case 'h': enemies.push(makeEnemy('hedgehog', px + 24, py + TILE)); break;
+    case 'f': enemies.push(makeEnemy('flower', px + TILE, py + TILE)); break; // сидит в пне под собой
+    case '-': platforms.push(makePlatform(tx, ty, 'h')); break;
+    case '^': platforms.push(makePlatform(tx, ty, 'v')); break;
+    case 'C': checkpoint = { x: px + 24, y: py + TILE, active: game.checkpoint }; break;
+    case 'F': setTile(tx, ty, T.STONE);
+      flag = { x: px + 24, topY: (ty - 9) * TILE, baseY: py, houseX: px + TILE * 4.5 }; break;
+    case 'D': warp.enter = { x: px + TILE, y: py + TILE }; break;   // центр верха пня-входа
+    case 'E': warp.exit = { x: px + TILE, y: py + TILE }; break;    // центр верха пня-выхода
+    case 'O': warp.caveOut = { x: px + TILE, y: py + TILE }; break; // пень-выход в пещере
+    case 'I': warp.caveIn = { x: px + 24, y: py }; break;           // откуда герой падает в пещеру
+  }
+}
+function loadLevel() {
+  tiles.fill(0); blocks.clear();
+  enemies.length = items.length = fireballs.length = particles.length = platforms.length = floatTexts.length = 0;
+  warp = { enter: null, exit: null, caveIn: null, caveOut: null };
+  const put = (rows, x0, w) => {
+    const off = ROWS - rows.length;
+    rows.forEach((row, r) => {
+      const s = row.padEnd(w, '.').slice(0, w);
+      for (let c = 0; c < w; c++) parseCell(s[c], x0 + c, r + off);
+    });
+  };
+  ZONES.forEach((z, i) => put(z, i * ZONE_W, ZONE_W));
+  put(CAVE, CAVE_X, CAVE_W);
+}
+
+// ---------- 5. Столкновения с тайлами (общие для героя, врагов и бонусов) ----------
+// После вызова: e.onGround, e.wall (-1/0/1), e.head ({tx,ty} блока, в который упёрлись головой)
+function moveBody(e, dt) {
+  e.wall = 0; e.head = null;
+  e.x += e.vx * dt;
+  const ya = Math.floor(e.y / TILE), yb = Math.floor((e.y + e.h - 0.01) / TILE);
+  if (e.vx > 0) {
+    const tx = Math.floor((e.x + e.w) / TILE);
+    for (let ty = ya; ty <= yb; ty++) if (solidAt(tx, ty)) { e.x = tx * TILE - e.w; e.wall = 1; break; }
+  } else if (e.vx < 0) {
+    const tx = Math.floor(e.x / TILE);
+    for (let ty = ya; ty <= yb; ty++) if (solidAt(tx, ty)) { e.x = (tx + 1) * TILE; e.wall = -1; break; }
+  }
+  e.y += e.vy * dt; e.onGround = false;
+  const xa = Math.floor(e.x / TILE), xb = Math.floor((e.x + e.w - 0.01) / TILE);
+  if (e.vy >= 0) {
+    const ty = Math.floor((e.y + e.h) / TILE);
+    for (let tx = xa; tx <= xb; tx++) if (solidAt(tx, ty)) { e.y = ty * TILE - e.h; e.vy = 0; e.onGround = true; break; }
+  } else {
+    const ty = Math.floor(e.y / TILE); let best = null, bd = 1e9;
+    for (let tx = xa; tx <= xb; tx++) if (solidAt(tx, ty)) {
+      const d = Math.abs((tx + 0.5) * TILE - (e.x + e.w / 2));
+      if (d < bd) { bd = d; best = { tx, ty }; }
+    }
+    if (best) { e.y = (ty + 1) * TILE; e.vy = 0; e.head = best; }
+  }
+}
+
+// ---------- 6. Частицы и всплывающие надписи (логика; отрисовка — часть 3) ----------
+function spawnP(type, x, y, n, o) {
+  o = o || {};
+  for (let i = 0; i < n && particles.length < 500; i++) {
+    const a = (o.ang !== undefined ? o.ang : -Math.PI / 2) + (Math.random() - 0.5) * (o.spread !== undefined ? o.spread : Math.PI * 2);
+    const s = (o.speed || 120) * rnd(0.4, 1.2);
+    particles.push({ type, x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, g: o.g !== undefined ? o.g : 600,
+      life: 0, max: (o.life || 0.6) * rnd(0.6, 1.2), size: (o.size || 6) * rnd(0.6, 1.4),
+      color: o.color || '#fff', rot: Math.random() * 6.28, vr: rnd(-5, 5) });
+  }
+}
+function updateFx(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i]; p.life += dt;
+    if (p.life >= p.max) { particles.splice(i, 1); continue; }
+    p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+  }
+  for (let i = floatTexts.length - 1; i >= 0; i--) {
+    const f = floatTexts[i]; f.t += dt; f.y -= 45 * dt;
+    if (f.t > 1) floatTexts.splice(i, 1);
+  }
+}
+
+// ---------- 7. Очки, монеты, жизни, режимы ----------
+function setMode(m) { game.mode = m; game.modeT = 0; }
+function addScore(n, x, y) { game.score += n; if (x !== undefined) floatTexts.push({ x, y, text: String(n), t: 0 }); }
+function addLife(x, y) { game.lives++; sfx('life'); if (x !== undefined) floatTexts.push({ x, y, text: '1UP', t: 0 }); }
+function addCoin(x, y) {
+  game.coins++; game.score += 200; sfx('coin');
+  if (game.coins >= 100) { game.coins -= 100; addLife(x, y); }
+}
+function setArea(name) {
+  area.name = name;
+  if (name === 'cave') { area.x0 = CAVE_X * TILE; area.x1 = LW * TILE; } else { area.x0 = 0; area.x1 = MAIN_W * TILE; }
+  cam.look = 0; cam.x = clamp(hero.x + hero.w / 2 - W * 0.42, area.x0, area.x1 - W);
+}
+function placeHero(cx, footY) {
+  const hh = hero.power > 0 ? HERO_BIG : HERO_SMALL;
+  Object.assign(hero, { x: cx - HERO_W / 2, y: footY - hh, w: HERO_W, h: hh, vx: 0, vy: 0, dir: 1,
+    onGround: false, wall: 0, head: null, coyote: 0, jumpBuf: 0, inv: 0, star: 0, crouch: false, skid: false,
+    state: 'normal', stateT: 0, t: 0, runPhase: 0, combo: 0, ride: null, fireCd: 0, grow: 0, growFrom: 0, landT: 0 });
+}
+function resetLevel(fromCheckpoint) {
+  loadLevel();
+  game.time = LEVEL_TIME; game.fade = 1; game.timeBonus = 0; game.flagBonus = 0;
+  hero.power = 0;
+  placeHero(fromCheckpoint && game.checkpoint ? checkpoint.x : 3.5 * TILE, 13 * TILE);
+  setArea('main');
+}
+function newGame(demo) {
+  game.score = 0; game.coins = 0; game.lives = 3; game.checkpoint = false; game.demo = !!demo;
+  resetLevel(false); setMode('play');
+}
+function togglePause() {
+  if (game.mode === 'play' && !game.demo) setMode('pause'); else if (game.mode === 'pause') setMode('play');
+}
+
+// ---------- 8. Ввод: клавиатура и сенсорные кнопки ----------
+const keys = {};
+const KEYMAP = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right', ArrowUp: 'jump', KeyW: 'jump',
+  Space: 'jump', ArrowDown: 'down', KeyS: 'down', ShiftLeft: 'run', ShiftRight: 'run', KeyX: 'fire', KeyF: 'fire' };
+const input = { left: false, right: false, down: false, jump: false, run: false, fire: false,
+  jumpPressed: false, firePressed: false, downPressed: false };
+let isTouch = false; // часть 4 рисует touchBtns, если true
+const touchBtns = [
+  { id: 'left', x: 90, y: 625, r: 56, on: false }, { id: 'right', x: 235, y: 625, r: 56, on: false },
+  { id: 'down', x: 162, y: 520, r: 46, on: false }, { id: 'jump', x: 1185, y: 610, r: 64, on: false },
+  { id: 'fire', x: 1045, y: 645, r: 54, on: false }, { id: 'pause', x: 1235, y: 115, r: 30, on: false }];
+window.addEventListener('keydown', e => {
+  if (KEYMAP[e.code]) e.preventDefault();
+  if (e.repeat) return;
+  if (typeof onAnyKey === 'function' && onAnyKey(e.code)) return; // часть 4: меню/демо/экраны; true = клавиша поглощена
+  keys[e.code] = true;
+  if (e.code === 'KeyM') { game.muted = !game.muted; if (typeof applyMute === 'function') applyMute(); }
+  if (e.code === 'KeyP') togglePause();
+  if (e.code === 'KeyR' && game.mode !== 'menu') newGame(false);
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; for (const b of touchBtns) b.on = false; });
+function touchPos(t) { // экранные координаты -> логические 1280×720 (с учётом полей)
+  const r = canvas.getBoundingClientRect(), s = Math.min(r.width / W, r.height / H);
+  return { x: (t.clientX - r.left - (r.width - W * s) / 2) / s, y: (t.clientY - r.top - (r.height - H * s) / 2) / s };
+}
+function onTouch(e) {
+  e.preventDefault(); isTouch = true;
+  for (const b of touchBtns) b.on = false;
+  for (const t of e.touches) {
+    const p = touchPos(t);
+    for (const b of touchBtns) if (Math.hypot(p.x - b.x, p.y - b.y) < b.r * 1.25) b.on = true;
+  }
+  if (e.type === 'touchstart') {
+    if (typeof onAnyKey === 'function' && onAnyKey('Touch')) { for (const b of touchBtns) b.on = false; return; }
+    const pb = touchBtns[5];
+    for (const t of e.changedTouches) { const p = touchPos(t); if (Math.hypot(p.x - pb.x, p.y - pb.y) < pb.r * 1.4) togglePause(); }
+  }
+}
+['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(n => canvas.addEventListener(n, onTouch, { passive: false }));
+canvas.addEventListener('mousedown', () => { if (typeof onAnyKey === 'function') onAnyKey('Mouse'); });
+function readInput() { // раз в шаг физики; в демо управление отдаёт botInput(input) из части 4
+  const pj = input.jump, pf = input.fire, pd = input.down;
+  input.left = input.right = input.down = input.jump = input.run = input.fire = false;
+  if (game.demo && typeof botInput === 'function') botInput(input);
+  else {
+    for (const c in KEYMAP) if (keys[c]) input[KEYMAP[c]] = true;
+    for (const b of touchBtns) if (b.on && b.id !== 'pause') { input[b.id] = true; if (b.id === 'fire') input.run = true; }
+  }
+  input.jumpPressed = input.jump && !pj; input.firePressed = input.fire && !pf; input.downPressed = input.down && !pd;
+}
+
+// ---------- 9. Герой: состояния, урон, физика ----------
+function setHeroH(nh) { hero.y += hero.h - nh; hero.h = nh; }
+function heroFits(hh) { // поместится ли герой высотой hh (ноги на месте)
+  const top = hero.y + hero.h - hh;
+  for (let ty = Math.floor(top / TILE); ty <= Math.floor((hero.y + hero.h - 1) / TILE); ty++)
+    for (let tx = Math.floor(hero.x / TILE); tx <= Math.floor((hero.x + hero.w - 0.01) / TILE); tx++)
+      if (solidAt(tx, ty)) return false;
+  return true;
+}
+function setPower(p) { // 0 маленький, 1 большой, 2 огненный
+  hero.growFrom = hero.power; hero.power = p; hero.grow = 0.6;
+  setHeroH(p > 0 && !hero.crouch ? HERO_BIG : HERO_SMALL);
+}
+function hurtHero() { // урон: на ступень ниже + неуязвимость; маленький теряет жизнь
+  if (hero.state !== 'normal' || hero.inv > 0 || hero.star > 0) return;
+  if (hero.power > 0) { setPower(hero.power - 1); hero.inv = 2; game.shake = 8; sfx('hurt'); }
+  else killHero();
+}
+function killHero() {
+  if (hero.state === 'dead') return;
+  hero.power = 0; hero.crouch = false; setHeroH(HERO_SMALL);
+  hero.state = 'dead'; hero.stateT = 0; hero.vx = 0; hero.vy = -820; hero.star = 0; hero.inv = 0; hero.ride = null;
+  game.shake = 10; sfx('die');
+}
+function afterDeath() {
+  game.lives--;
+  if (game.lives <= 0) { saveHiscore(); setMode('over'); } else resetLevel(true);
+}
+function updateHero(dt) {
+  const h = hero; h.t += dt;
+  if (h.inv > 0) h.inv -= dt;
+  if (h.star > 0) h.star -= dt;
+  if (h.fireCd > 0) h.fireCd -= dt;
+  if (h.grow > 0) h.grow -= dt;
+  if (h.landT > 0) h.landT -= dt;
+  if (h.state === 'dead') { // подпрыгнул и упал за экран
+    h.stateT += dt;
+    if (h.stateT > 0.45) { h.vy = Math.min(h.vy + PHYS.grav * dt, PHYS.maxFall); h.y += h.vy * dt; }
+    if (h.stateT > 2.4) afterDeath();
+    return;
+  }
+  if (h.state !== 'normal') return; // 'pipe' | 'flag' | 'win' — сценки ведёт часть 2
+  const wasGround = h.onGround;
+  // приседание и высота хитбокса
+  const wantCrouch = input.down && h.onGround;
+  if (h.power > 0) {
+    const low = wantCrouch || (h.h === HERO_SMALL && !heroFits(HERO_BIG));
+    h.crouch = low;
+    if (low && h.h !== HERO_SMALL) setHeroH(HERO_SMALL);
+    if (!low && h.h !== HERO_BIG) setHeroH(HERO_BIG);
+  } else h.crouch = wantCrouch;
+  // горизонталь: плавный разгон, инерция, торможение с пылью
+  const move = (h.crouch && h.onGround) ? 0 : (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  const max = input.run ? PHYS.run : PHYS.walk;
+  h.skid = false;
+  if (move) {
+    h.dir = move;
+    if (h.vx * move < 0) {
+      h.vx += move * PHYS.skid * dt;
+      if (h.onGround && Math.abs(h.vx) > 90) {
+        h.skid = true;
+        if (game.frame % 3 === 0) spawnP('dust', h.x + h.w / 2, h.y + h.h, 1, { speed: 60, spread: 1.2, g: -40, life: 0.45, size: 9, color: '#e9dcc0' });
+      }
+    } else if (Math.abs(h.vx) <= max) h.vx = clamp(h.vx + move * (h.onGround ? PHYS.acc : PHYS.airAcc) * dt, -max, max);
+    else h.vx -= move * PHYS.fric * 0.5 * dt;
+  } else if (h.onGround) {
+    const f = PHYS.fric * dt;
+    h.vx = Math.abs(h.vx) <= f ? 0 : h.vx - sign(h.vx) * f;
+  }
+  h.runPhase += Math.abs(h.vx) * dt * 0.05;
+  // прыжок: койот-тайм, буфер, высота по длительности нажатия
+  h.coyote = h.onGround ? PHYS.coyote : h.coyote - dt;
+  h.jumpBuf = input.jumpPressed ? PHYS.buffer : h.jumpBuf - dt;
+  if (h.jumpBuf > 0 && h.coyote > 0) {
+    h.vy = -(PHYS.jump + Math.abs(h.vx) * 0.12);
+    h.jumpBuf = 0; h.coyote = 0; h.onGround = false; h.ride = null; sfx('jump');
+  }
+  h.vy = Math.min(h.vy + PHYS.grav * ((h.vy < 0 && !input.jump) ? PHYS.cut : 1) * dt, PHYS.maxFall);
+  // движущаяся платформа несёт героя (платформы уже сдвинуты в updateWorld, их шаг — p.dx, p.dy)
+  const ride = h.ride; h.ride = null;
+  if (ride) { h.x += ride.dx; h.y = ride.y - h.h; }
+  const prevY = h.y, prevB = h.y + h.h, vy0 = h.vy;
+  moveBody(h, dt);
+  if (h.vy >= 0) for (const p of platforms) {
+    if (h.x + h.w > p.x + 2 && h.x < p.x + p.w - 2 && prevB <= p.y + 8 && h.y + h.h >= p.y - 1) {
+      h.y = p.y - h.h; h.vy = 0; h.onGround = true; h.ride = p; break;
+    }
+  }
+  // скрытый блок: твёрдый только при ударе головой снизу
+  if (vy0 < 0 && !h.head) {
+    const ty = Math.floor(h.y / TILE), tx = Math.floor((h.x + h.w / 2) / TILE);
+    if (tileAt(tx, ty) === T.HIDDEN && prevY >= (ty + 1) * TILE - 1) { h.y = (ty + 1) * TILE; h.vy = 0; h.head = { tx, ty }; }
+  }
+  if (h.head && typeof bumpBlock === 'function') bumpBlock(h.head.tx, h.head.ty, h); // часть 2
+  // границы области
+  if (h.x < area.x0) { h.x = area.x0; if (h.vx < 0) h.vx = 0; }
+  if (h.x > area.x1 - h.w) { h.x = area.x1 - h.w; if (h.vx > 0) h.vx = 0; }
+  if (h.onGround) {
+    if (!wasGround) {
+      h.landT = 0.15;
+      spawnP('dust', h.x + h.w / 2, h.y + h.h, 4, { speed: 70, spread: 2.6, g: -30, life: 0.4, size: 8, color: '#e9dcc0' });
+    }
+    h.combo = 0; // серия прыжков по врагам обрывается на земле
+  }
+  if (input.firePressed && h.power === 2 && !h.crouch && typeof shootFire === 'function') shootFire(); // часть 2
+  if (h.y > H + 80) killHero(); // яма
+}
+
+// ---------- 10. Камера с мягким следованием ----------
+function updateCamera(dt) {
+  if (hero.state === 'dead') return;
+  cam.look += (hero.dir * 70 - cam.look) * Math.min(1, dt * 2);
+  const target = clamp(hero.x + hero.w / 2 - W * 0.42 + cam.look, area.x0, area.x1 - W);
+  cam.x += (target - cam.x) * Math.min(1, dt * 6);
+  cam.x = clamp(cam.x, area.x0, area.x1 - W);
+}
+
+// ---------- 11. Игровой цикл с фиксированным шагом ----------
+// Порядок шага: updateWorld (часть 2: платформы, блоки, враги, бонусы, сценки) -> герой -> камера -> эффекты.
+function step(dt) {
+  game.frame++; game.modeT += dt;
+  readInput();
+  if (game.mode === 'play') {
+    if (typeof updateWorld === 'function') updateWorld(dt);
+    updateHero(dt);
+    updateCamera(dt);
+    if (hero.state === 'normal') {
+      game.time -= dt;
+      if (game.time <= 0) { game.time = 0; killHero(); }
+    }
+  }
+  if (game.mode !== 'pause') updateFx(dt);
+  if (typeof updateMeta === 'function') updateMeta(dt); // часть 4: меню, демо-таймер, музыка
+  game.shake = Math.max(0, game.shake - dt * 30);
+  game.fade = Math.max(0, game.fade - dt * 2);
+}
+let lastT = 0, accT = 0;
+function loop(ts) {
+  requestAnimationFrame(loop);
+  if (!lastT) lastT = ts;
+  accT += Math.min(0.1, (ts - lastT) / 1000); lastT = ts;
+  let n = 0;
+  while (accT >= DT && n < 5) { step(DT); accT -= DT; n++; }
+  if (n === 5) accT = 0;
+  if (typeof renderFrame === 'function') renderFrame(); // часть 3
+}
+resetLevel(false); // мир готов для меню; цикл запускается последней строкой части 4
+
+// ================= ЧАСТЬ 2: МИР — блоки, бонусы, враги, огоньки, платформы, сценки =================
+// Памятка для частей 3–4:
+//  bumpOffset(tx,ty) — сдвиг блока по Y при ударе; flagClothY() — высота полотнища флага;
+//  items: type coin|acorn|flower|star|life, state 'rise' (выезжает из блока — рисовать ПОД тайлами) | 'move';
+//  enemies: state walk|squash|shell|slide|dead (dead — рисовать перевёрнутым), цветок: hide|rise|up|sink, e.rise 0..1
+//           (рисовать с обрезкой по e.baseY — верх пня);
+//  hero.state 'pipe': обрезать героя по scene.pipe.clipY; 'flag' — держится за шест; 'win': scene.phase 0 идёт, 1–2 победная поза;
+//  частицы: dust, shard, spark, coinpop, rainbow, leaf, firefly;
+//  звуки sfx: jump bump break coin sprout power star life stomp kick fire pipe checkpoint flag win tick hurt die.
+
+// ---------- 1. Общие помощники и состояние сценок ----------
+const scene = { pipe: null, flagY: 0, phase: 0, t: 0 };
+const bumpAnim = new Map(); // ключ блока -> оставшееся время подпрыгивания
+const BUMP_T = 0.18;
+const COMBO = [100, 200, 400, 800, 1000, 2000, 4000, 8000];
+const ITEM_SPEED = { acorn: 120, life: 140, star: 180, flower: 0 };
+const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+const onScreen = (e, m) => e.x + e.w > cam.x - m && e.x < cam.x + W + m;
+function bumpOffset(tx, ty) {
+  const t = bumpAnim.get(bkey(tx, ty));
+  return t ? -Math.sin((1 - t / BUMP_T) * Math.PI) * 14 : 0;
+}
+function flagClothY() { return hero.state === 'flag' || hero.state === 'win' ? scene.flagY : flag.topY + 8; }
+function comboScore(n, x, y) { if (n >= COMBO.length) addLife(x, y); else addScore(COMBO[n], x, y); }
+
+// ---------- 2. Блоки и удары по ним ----------
+function popCoin(x, y) { // монетка, вылетающая из блока (только эффект)
+  particles.push({ type: 'coinpop', x, y: y - 10, vx: 0, vy: -640, g: 1900, life: 0, max: 0.6, size: 15,
+    color: '#ffd23e', rot: 0, vr: 14 });
+}
+function spawnItem(type, tx, ty) { // бонус выезжает из блока вверх
+  items.push({ type, x: tx * TILE + 6, y: ty * TILE + 4, w: 36, h: 36, vx: 0, vy: 0, fixed: false, t: 0,
+    state: 'rise', riseY: ty * TILE - 36, dir: 1, onGround: false, wall: 0, head: null });
+  sfx('sprout');
+}
+function knockAbove(tx, ty) { // подбросить всё, что стоит на блоке
+  const x0 = tx * TILE, top = ty * TILE;
+  for (const e of enemies) {
+    if (!e.alive || e.type === 'flower' || e.state === 'dead') continue;
+    if (e.x + e.w > x0 && e.x < x0 + TILE && Math.abs(e.y + e.h - top) < 6)
+      killEnemy(e, e.x + e.w / 2 < x0 + 24 ? -1 : 1, 100);
+  }
+  for (const it of items) {
+    if (it.gone || it.state === 'rise' || it.x + it.w <= x0 || it.x >= x0 + TILE) continue;
+    if (Math.abs(it.y + it.h - top) > 10) continue;
+    if (it.fixed) { collectItem(it); popCoin(it.x + it.w / 2, it.y + 20); it.gone = true; }
+    else { it.vy = -480; it.dir = it.x + it.w / 2 < x0 + 24 ? -1 : 1; }
+  }
+}
+function bumpBlock(tx, ty, h) { // вызывается из updateHero при ударе головой
+  const t = tileAt(tx, ty), k = bkey(tx, ty), b = blocks.get(k), cx = (tx + 0.5) * TILE, top = ty * TILE;
+  if (t !== T.BRICK && t !== T.Q && t !== T.HIDDEN) { if (t === T.USED || t === T.STONE) sfx('bump'); return; }
+  knockAbove(tx, ty);
+  if (!b) { // обычный кирпич: большой разбивает, маленький подталкивает
+    if (h.power > 0) {
+      setTile(tx, ty, T.EMPTY); bumpAnim.delete(k);
+      spawnP('shard', cx, top + 24, 8, { speed: 400, spread: 1.9, g: 1500, life: 0.9, size: 12, color: '#c8703a' });
+      addScore(50); game.shake = Math.max(game.shake, 5); sfx('break');
+    } else { bumpAnim.set(k, BUMP_T); sfx('bump'); }
+    return;
+  }
+  bumpAnim.set(k, BUMP_T); sfx('bump');
+  if (b.item === 'coin' || b.item === 'multi') {
+    addCoin(cx, top - 20); popCoin(cx, top);
+    if (b.item === 'multi' && --b.n > 0) return; // блок с десятью монетами ещё не пуст
+  } else if (b.item === 'power') spawnItem(h.power > 0 ? 'flower' : 'acorn', tx, ty);
+  else spawnItem(b.item, tx, ty); // star | life
+  blocks.delete(k); setTile(tx, ty, T.USED);
+}
+
+// ---------- 3. Бонусы и монеты ----------
+function collectItem(it) {
+  const x = it.x + it.w / 2, y = it.y;
+  if (it.type === 'coin') {
+    addCoin(x, y);
+    spawnP('spark', x, y + 16, 5, { speed: 90, life: 0.35, size: 5, color: '#fff3a0', g: 0 });
+    return;
+  }
+  if (it.type === 'life') { addLife(x, y); return; }
+  addScore(1000, x, y);
+  spawnP('spark', x, y + 18, 10, { speed: 170, life: 0.5, size: 6, color: '#ffe680', g: 100 });
+  if (it.type === 'star') { hero.star = 10; sfx('star'); return; }
+  const p = it.type === 'flower' ? 2 : 1;
+  if (hero.power < p) { setPower(p); if (!heroFits(hero.h)) setHeroH(HERO_SMALL); }
+  sfx('power');
+}
+function updateItems(dt) {
+  const h = hero;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i]; it.t += dt;
+    if (it.gone) { items.splice(i, 1); continue; }
+    if (it.state === 'rise') {
+      it.y -= 70 * dt;
+      if (it.y <= it.riseY) { it.y = it.riseY; it.state = 'move'; }
+      continue;
+    }
+    if (!it.fixed) { // жёлудь и жизнь катятся, звезда скачет, цветок стоит
+      it.vx = it.dir * ITEM_SPEED[it.type];
+      it.vy = Math.min(it.vy + PHYS.grav * (it.type === 'star' ? 0.55 : 1) * dt, PHYS.maxFall);
+      moveBody(it, dt);
+      if (it.wall) it.dir = -it.wall;
+      if (it.type === 'star' && it.onGround) it.vy = -600;
+      if (it.y > H + 100) { items.splice(i, 1); continue; }
+    }
+    if (h.state === 'normal' && overlap(h, it)) { collectItem(it); items.splice(i, 1); }
+  }
+}
+
+// ---------- 4. Враги ----------
+function killEnemy(e, dx, pts) { // сбит огоньком, раковиной, звездой или ударом по блоку
+  if (!e.alive || e.state === 'dead') return;
+  const cx = e.x + e.w / 2;
+  addScore(pts, cx, e.y - 10); sfx('kick');
+  spawnP('spark', cx, e.y + e.h / 2, 6, { speed: 170, life: 0.4, size: 6, color: '#ffe680', g: 200 });
+  if (e.type === 'flower') {
+    e.alive = false;
+    spawnP('leaf', cx, e.y + 10, 8, { speed: 200, life: 0.8, size: 9, color: '#5fbf4a', g: 700 });
+    return;
+  }
+  e.state = 'dead'; e.t = 0; e.vx = (dx || 1) * 150; e.vy = -520;
+}
+function updateFlower(e, dt) { // хищный цветок выглядывает из пня; не вылезает, если герой рядом
+  e.t += dt;
+  const near = Math.abs(hero.x + hero.w / 2 - (e.x + e.w / 2)) < 84;
+  if (e.state === 'hide') { e.rise = 0; if (e.t > 1.6 && !near) { e.state = 'rise'; e.t = 0; } }
+  else if (e.state === 'rise') { e.rise = Math.min(1, e.t / 0.6); if (e.rise >= 1) { e.state = 'up'; e.t = 0; } }
+  else if (e.state === 'up') { if (e.t > 1.5) { e.state = 'sink'; e.t = 0; } }
+  else { e.rise = Math.max(0, 1 - e.t / 0.6); if (e.rise <= 0) { e.state = 'hide'; e.t = 0; } }
+  e.y = e.baseY - e.rise * e.h;
+}
+function updateWalker(e, dt) { // жук, улитка (и её раковина), ёж
+  e.t += dt;
+  if (e.kickT > 0) e.kickT -= dt;
+  if (e.state === 'squash') { if (e.t > 0.45) e.alive = false; return; }
+  if (e.state === 'dead') {
+    e.vy += PHYS.grav * dt; e.x += e.vx * dt; e.y += e.vy * dt;
+    if (e.y > H + 120) e.alive = false;
+    return;
+  }
+  if (e.state === 'shell') { e.vx = 0; if (e.t > 7) { e.state = 'walk'; e.t = 0; } } // улитка вылезает обратно
+  else if (e.state === 'slide') e.vx = e.dir * 540;
+  else e.vx = e.dir * e.speed;
+  e.vy = Math.min(e.vy + PHYS.grav * dt, PHYS.maxFall);
+  moveBody(e, dt);
+  if (e.wall) {
+    e.dir = -e.wall;
+    if (e.state === 'slide' && onScreen(e, 0)) sfx('bump');
+  } else if (e.state === 'walk' && e.onGround) { // разворот у края обрыва
+    const fx = e.dir > 0 ? e.x + e.w + 1 : e.x - 1;
+    if (!solidAt(Math.floor(fx / TILE), Math.floor((e.y + e.h + 2) / TILE))) e.dir = -e.dir;
+  }
+  if (e.y > H + 120 || (e.state === 'slide' && !onScreen(e, W))) e.alive = false;
+}
+function heroVsEnemy(e, falling) {
+  const h = hero;
+  if (e.state === 'dead' || e.state === 'squash' || !overlap(h, e)) return;
+  const cx = e.x + e.w / 2;
+  if (e.type === 'flower') {
+    if (e.rise < 0.2) return;
+    if (h.star > 0) killEnemy(e, h.dir, 200); else hurtHero();
+    return;
+  }
+  if (h.star > 0) { killEnemy(e, h.dir, 200); return; }
+  if (e.kickT > 0) return; // короткая пауза после прыжка/пинка, чтобы не задеть себя
+  const above = falling && h.y + h.h < e.y + e.h * 0.75;
+  if (e.state === 'shell') { // пинок неподвижной раковины
+    e.state = 'slide'; e.dir = h.x + h.w / 2 < cx ? 1 : -1; e.kickT = 0.3; e.combo = 0;
+    if (above) h.vy = -420;
+    addScore(400, cx, e.y - 10); sfx('kick');
+    return;
+  }
+  if (above && e.type !== 'hedgehog') { // прыжок сверху
+    if (e.type === 'beetle') e.state = 'squash'; else { e.state = 'shell'; e.kickT = 0.25; }
+    e.t = 0; e.vx = 0;
+    h.vy = input.jump ? -800 : -520;
+    comboScore(h.combo++, cx, e.y - 10);
+    sfx('stomp'); game.shake = Math.max(game.shake, 3);
+    spawnP('dust', cx, e.y + e.h, 5, { speed: 90, spread: 2.8, g: -20, life: 0.4, size: 8, color: '#e9dcc0' });
+    return;
+  }
+  hurtHero(); // касание сбоку, ёж или летящая раковина
+}
+function updateEnemies(dt) {
+  const h = hero, falling = h.vy > 60;
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (!e.alive) { enemies.splice(i, 1); continue; }
+    if (e.type === 'flower') updateFlower(e, dt);
+    else {
+      if (!e.active) { if (onScreen(e, 90)) e.active = true; else continue; }
+      updateWalker(e, dt);
+    }
+    if (e.alive && h.state === 'normal') heroVsEnemy(e, falling);
+  }
+  // враги между собой: раковина сбивает, остальные разворачиваются
+  const ok = e => e.alive && e.active && e.type !== 'flower' && e.state !== 'dead' && e.state !== 'squash';
+  for (let i = 0; i < enemies.length; i++) {
+    const a = enemies[i];
+    if (!ok(a)) continue;
+    for (let j = i + 1; j < enemies.length; j++) {
+      const b = enemies[j];
+      if (!ok(b) || !overlap(a, b)) continue;
+      if (a.state === 'slide' || b.state === 'slide') {
+        const s = a.state === 'slide' ? a : b, v = s === a ? b : a;
+        s.combo = (s.combo || 0) + 1;
+        killEnemy(v, s.dir, COMBO[Math.min(s.combo, COMBO.length - 1)]);
+        if (a.state === 'dead') break;
+      } else { a.dir = a.x < b.x ? -1 : 1; b.dir = -a.dir; }
+    }
+  }
+}
+
+// ---------- 5. Огоньки ----------
+function shootFire() { // вызывается из updateHero; не больше двух на экране
+  const h = hero;
+  if (fireballs.length >= 2 || h.fireCd > 0) return;
+  fireballs.push({ x: h.x + h.w / 2 + h.dir * 14 - 8, y: h.y + h.h * 0.35, w: 16, h: 16, vx: h.dir * 640, vy: 120,
+    t: 0, onGround: false, wall: 0, head: null });
+  h.fireCd = 0.22; sfx('fire');
+}
+function updateFireballs(dt) {
+  for (let i = fireballs.length - 1; i >= 0; i--) {
+    const f = fireballs[i]; f.t += dt;
+    f.vy = Math.min(f.vy + 2400 * dt, 700);
+    moveBody(f, dt);
+    let boom = f.wall !== 0 || f.head !== null;
+    if (f.onGround) f.vy = -420; // прыгает по земле
+    for (const e of enemies) {
+      if (!e.alive || e.state === 'dead' || e.state === 'squash') continue;
+      if (e.type === 'flower' ? e.rise < 0.2 : !e.active) continue;
+      if (overlap(f, e)) { killEnemy(e, sign(f.vx), 200); boom = true; break; }
+    }
+    if (game.frame % 2 === 0) spawnP('spark', f.x + 8, f.y + 8, 1, { speed: 30, life: 0.25, size: 5, color: '#ffb030', g: 0 });
+    if (boom) {
+      spawnP('spark', f.x + 8, f.y + 8, 8, { speed: 190, life: 0.35, size: 6, color: '#ff7a2a', g: 300 });
+      fireballs.splice(i, 1);
+    } else if (f.x < cam.x - 60 || f.x > cam.x + W + 60 || f.y > H + 40) fireballs.splice(i, 1);
+  }
+}
+
+// ---------- 6. Движущиеся платформы ----------
+function updatePlatforms(dt) {
+  for (const p of platforms) {
+    p.t += dt;
+    const k = 0.5 - 0.5 * Math.cos(p.t * (p.axis === 'h' ? 1.2 : 1.4));
+    const nx = p.axis === 'h' ? p.x0 + p.range * k : p.x0, ny = p.axis === 'v' ? p.y0 - p.range * k : p.y0;
+    p.dx = nx - p.x; p.dy = ny - p.y; p.x = nx; p.y = ny;
+  }
+}
+
+// ---------- 7. Спуск в пень и пещера ----------
+function tryEnterPipe() {
+  const h = hero, from = area.name === 'main' ? warp.enter : warp.caveOut;
+  if (!from || !h.onGround || !input.down) return false;
+  if (Math.abs(h.x + h.w / 2 - from.x) > 26 || Math.abs(h.y + h.h - from.y) > 3) return false;
+  h.state = 'pipe'; h.stateT = 0; h.vx = h.vy = 0; h.ride = null; h.crouch = false;
+  if (h.power > 0 && h.h !== HERO_BIG) setHeroH(HERO_BIG);
+  scene.pipe = { phase: 'in', toCave: area.name === 'main', cx: from.x, clipY: from.y };
+  sfx('pipe');
+  return true;
+}
+function updatePipe(dt) {
+  const h = hero, p = scene.pipe; h.stateT += dt;
+  if (p.phase === 'in') { // погружается в пень
+    h.x += (p.cx - h.w / 2 - h.x) * Math.min(1, dt * 10);
+    h.y += 105 * dt;
+    if (h.stateT < 0.95) return;
+    game.fade = 1; h.vx = h.vy = 0; fireballs.length = 0;
+    if (p.toCave) { // падает с потолка пещеры
+      h.x = warp.caveIn.x - h.w / 2; h.y = warp.caveIn.y; h.state = 'normal'; h.onGround = false;
+      setArea('cave');
+    } else { // вылезает из пня дальше по уровню
+      h.x = warp.exit.x - h.w / 2; h.y = warp.exit.y; h.stateT = 0;
+      p.phase = 'out'; p.clipY = warp.exit.y;
+      setArea('main'); sfx('pipe');
+    }
+  } else {
+    h.y -= 105 * dt;
+    if (h.y + h.h <= p.clipY) { h.y = p.clipY - h.h; h.state = 'normal'; h.onGround = true; h.dir = 1; }
+  }
+}
+
+// ---------- 8. Чекпоинт, флаг и финиш ----------
+function grabFlag() {
+  const h = hero;
+  const frac = clamp((flag.baseY - (h.y + h.h)) / (flag.baseY - flag.topY), 0, 1); // чем выше, тем больше очков
+  game.flagBonus = frac > 0.9 ? 5000 : frac > 0.65 ? 2000 : frac > 0.4 ? 800 : frac > 0.15 ? 400 : 100;
+  h.state = 'flag'; h.stateT = 0; h.vx = h.vy = 0; h.dir = 1; h.star = 0; h.inv = 0; h.ride = null; h.crouch = false;
+  if (h.power > 0 && h.h !== HERO_BIG) setHeroH(HERO_BIG);
+  if (h.y < flag.topY) h.y = flag.topY;
+  addScore(game.flagBonus, flag.x + 50, h.y + 10);
+  game.time = Math.ceil(game.time);
+  scene.phase = 0; scene.t = 0; scene.flagY = flag.topY + 8;
+  fireballs.length = 0; sfx('flag');
+}
+function updateFinish(dt) {
+  const h = hero; h.stateT += dt;
+  if (h.state === 'flag') {
+    const ty = flag.baseY - h.h, lowY = flag.baseY - 44;
+    h.x += (flag.x - h.w + 4 - h.x) * Math.min(1, dt * 14);
+    if (scene.phase === 0) { // съезжает по шесту вместе с флагом
+      h.y = h.y < ty ? Math.min(ty, h.y + 300 * dt) : Math.max(ty, h.y - 300 * dt);
+      scene.flagY = Math.min(lowY, scene.flagY + 300 * dt);
+      if (h.y === ty && scene.flagY >= lowY) { scene.phase = 1; scene.t = 0; }
+    } else if ((scene.t += dt) > 0.35) { // спрыгивает и идёт к норке
+      h.state = 'win'; h.stateT = 0; scene.phase = 0; scene.t = 0; h.vy = -380; h.onGround = false;
+    }
+    return;
+  }
+  // h.state === 'win'
+  h.vx = scene.phase === 0 ? 170 : 0; h.dir = 1;
+  h.vy = Math.min(h.vy + PHYS.grav * dt, PHYS.maxFall);
+  moveBody(h, dt);
+  if (scene.phase === 0) {
+    h.runPhase += 170 * dt * 0.05;
+    if (h.x + h.w / 2 >= flag.houseX) { scene.phase = 1; scene.t = 0; sfx('win'); }
+  } else if (scene.phase === 1) { // победная поза, салют и подсчёт очков за время
+    scene.t += dt;
+    if (game.frame % 18 === 0)
+      spawnP('spark', h.x + rnd(-260, 260), rnd(160, 420), 14,
+        { speed: 230, life: 0.8, size: 7, g: 220, color: `hsl(${Math.floor(rnd(0, 360))},100%,65%)` });
+    if (scene.t > 0.8) {
+      if (game.time > 0) {
+        const d = Math.min(game.time, 2);
+        game.time -= d; game.timeBonus += d * 50; game.score += d * 50;
+        if (game.frame % 4 === 0) sfx('tick');
+      } else { scene.phase = 2; scene.t = 0; }
+    }
+  } else if ((scene.t += dt) > 1.6) {
+    game.newRecord = game.demo ? false : saveHiscore();
+    setMode('win');
+  }
+}
+function checkTriggers() { // только для hero.state === 'normal'
+  const h = hero;
+  if (tryEnterPipe() || area.name !== 'main') return;
+  if (!checkpoint.active && h.x + h.w / 2 > checkpoint.x) {
+    checkpoint.active = true; game.checkpoint = true;
+    addScore(500, checkpoint.x, checkpoint.y - 130); sfx('checkpoint');
+    spawnP('spark', checkpoint.x, checkpoint.y - 90, 14, { speed: 200, life: 0.7, size: 7, color: '#ffe680', g: 250 });
+  }
+  if (h.x + h.w >= flag.x - 26 && h.x < flag.x + 30) grabFlag();
+}
+
+// ---------- 9. Атмосфера: листья днём, светлячки вечером, радужный шлейф звезды ----------
+function updateAmbient() {
+  const h = hero;
+  if (h.star > 0 && h.state === 'normal' && game.frame % 2 === 0)
+    spawnP('rainbow', h.x + h.w / 2 - h.dir * 8, h.y + h.h * rnd(0.15, 0.9), 1,
+      { speed: 20, g: 0, life: 0.5, size: 11, color: `hsl(${game.frame * 9 % 360},100%,62%)` });
+  if (area.name !== 'main' || game.frame % 12) return;
+  const z = zoneOf(cam.x + W / 2);
+  if (z <= 1) spawnP('leaf', cam.x + rnd(0, W + 200), -10, 1,
+    { ang: 2.2, spread: 0.5, speed: 110, g: 25, life: 6, size: 9, color: z ? '#e8a23a' : '#8fd45a' });
+  else spawnP('firefly', cam.x + rnd(0, W), rnd(250, 600), 1, { speed: 25, g: 0, life: 3, size: 4, color: '#fff7a0' });
+}
+
+// ---------- 10. Шаг мира (вызывается из step() перед updateHero) ----------
+function updateWorld(dt) {
+  const h = hero;
+  updatePlatforms(dt);
+  for (const [k, t] of bumpAnim) { if (t - dt <= 0) bumpAnim.delete(k); else bumpAnim.set(k, t - dt); }
+  if (h.state === 'pipe') updatePipe(dt);
+  else if (h.state === 'flag' || h.state === 'win') updateFinish(dt);
+  else if (h.state === 'normal') checkTriggers();
+  updateItems(dt);
+  updateEnemies(dt);
+  updateFireballs(dt);
+  updateAmbient();
+}
+
+// ================= ЧАСТЬ 3: ГРАФИКА =================
+// Памятка для части 4:
+//  drawFox(cx, footY, {power, dir, pose, t, phase, star, land, scale}) — позы idle|run|jump|fall|skid|crouch|hurt|win|climb;
+//  drawCoin(x, y, r, w) — монета (w = cos фазы вращения); drawBackdrop(camX, p) — небо и параллакс (p: 0 день … 1 закат);
+//  помощники: rr, fillRR, ell, line, starPath, mixC, hash, TAU; renderFrame() в конце вызывает drawUI(), если она объявлена.
+
+// ---------- 1. Помощники рисования ----------
+const TAU = Math.PI * 2;
+const mixC = (a, b, t) => `rgb(${Math.round(lerp(a[0], b[0], t))},${Math.round(lerp(a[1], b[1], t))},${Math.round(lerp(a[2], b[2], t))})`;
+const hash = n => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function fillRR(x, y, w, h, r, c) { rr(x, y, w, h, r); ctx.fillStyle = c; ctx.fill(); }
+function ell(x, y, rx, ry, c) { ctx.beginPath(); ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), 0, 0, TAU); ctx.fillStyle = c; ctx.fill(); }
+function line(x1, y1, x2, y2, c, w) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.strokeStyle = c; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.stroke(); }
+function starPath(x, y, R, r, rot) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) { const a = rot + i * Math.PI / 5 - Math.PI / 2, q = i % 2 ? r : R; ctx.lineTo(x + Math.cos(a) * q, y + Math.sin(a) * q); }
+  ctx.closePath();
+}
+function shadow(cx, y, rx, a) { ell(cx, y, rx, rx * 0.28, `rgba(20,30,50,${a})`); }
+function dropShadow(cx, footY, rx) { // мягкая тень на ближайшей опоре под объектом
+  const tx = Math.floor(cx / TILE);
+  for (let ty = Math.floor((footY - 1) / TILE) + 1; ty < ROWS; ty++) if (solidAt(tx, ty)) {
+    const d = ty * TILE - footY;
+    if (d < 240) shadow(cx, ty * TILE + 3, rx * (1 - d / 400), 0.26 * (1 - d / 240));
+    return;
+  }
+}
+
+// ---------- 2. Освещение, небо и параллакс ----------
+const PAL = { // [день, закат]
+  skyT: [[62, 150, 235], [72, 52, 128]], skyM: [[140, 205, 250], [232, 112, 130]], skyB: [[226, 246, 255], [255, 204, 128]],
+  sun: [[255, 244, 170], [255, 128, 78]], cloud: [[255, 255, 255], [255, 186, 168]], mount: [[150, 186, 232], [124, 82, 150]],
+  hill: [[124, 204, 132], [166, 96, 120]], hill2: [[92, 182, 110], [126, 70, 108]], wood: [[52, 140, 92], [78, 46, 92]], bush: [[66, 166, 84], [96, 58, 94]] };
+const pal = (k, p) => mixC(PAL[k][0], PAL[k][1], p);
+function lightLevel() { // 0 — день, 1 — закат; плавно растёт по ходу уровня
+  const k = clamp((cam.x - 30 * TILE) / (130 * TILE), 0, 1);
+  return area.name === 'cave' ? 0 : k * k * (3 - 2 * k);
+}
+function ridge(off, step, baseY, amp, seed, smooth, color) { // силуэт гряды: горы (ломаная) или холмы (плавная)
+  const i0 = Math.floor(off / step) - 1, n = Math.ceil(W / step) + 3, hy = i => baseY - amp * (0.35 + 0.65 * hash(i * 1.37 + seed));
+  let px = i0 * step - off, py = hy(i0);
+  ctx.beginPath(); ctx.moveTo(-10, H); ctx.lineTo(px, py);
+  for (let i = i0 + 1; i <= i0 + n; i++) {
+    const x = i * step - off, y = hy(i);
+    if (smooth) ctx.quadraticCurveTo(px, py, (px + x) / 2, (py + y) / 2); else ctx.lineTo(x, y);
+    px = x; py = y;
+  }
+  ctx.lineTo(W + 10, H); ctx.closePath(); ctx.fillStyle = color; ctx.fill();
+}
+function drawBackdrop(cx, p) {
+  const now = game.frame / 60, g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, pal('skyT', p)); g.addColorStop(0.55, pal('skyM', p)); g.addColorStop(1, pal('skyB', p));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  if (p > 0.5) for (let i = 0; i < 40; i++) { // первые звёзды
+    ctx.globalAlpha = (p - 0.5) * 2 * (0.35 + 0.65 * Math.abs(Math.sin(now * 1.5 + i)));
+    ell(hash(i) * W, hash(i + 50) * 300, 1.6, 1.6, '#fff');
+  }
+  ctx.globalAlpha = 1;
+  const sx = 1000 - p * 180 - cx * 0.01, sy = 120 + p * 370, sg = ctx.createRadialGradient(sx, sy, 10, sx, sy, 280); // солнце
+  sg.addColorStop(0, 'rgba(255,238,170,0.8)'); sg.addColorStop(1, 'rgba(255,220,150,0)');
+  ctx.fillStyle = sg; ctx.fillRect(sx - 280, sy - 280, 560, 560);
+  ell(sx, sy, 58 + p * 14, 58 + p * 14, pal('sun', p));
+  const cc = pal('cloud', p);
+  for (let i = 0; i < 9; i++) { // облака в три слоя
+    const x = ((hash(i + 3) * 2600 - cx * (0.08 + (i % 3) * 0.04) + now * (5 + (i % 4) * 3)) % 2600 + 2600) % 2600 - 300;
+    const y = 60 + hash(i + 20) * 230, s = 0.7 + hash(i + 9) * 0.9;
+    ell(x, y, 70 * s, 26 * s, cc); ell(x - 42 * s, y + 8 * s, 44 * s, 20 * s, cc); ell(x + 46 * s, y + 6 * s, 50 * s, 22 * s, cc); ell(x + 8 * s, y - 18 * s, 40 * s, 26 * s, cc);
+  }
+  ridge(cx * 0.12, 190, 560, 300, 1, false, pal('mount', p));
+  ridge(cx * 0.25, 240, 610, 170, 7, true, pal('hill', p));
+  ridge(cx * 0.4, 180, 650, 120, 13, true, pal('hill2', p));
+  const off = cx * 0.55, i0 = Math.floor(off / 130) - 1, wc = pal('wood', p);
+  for (let i = i0; i < i0 + 13; i++) { // лес: лиственные деревья и ели
+    const r = hash(i * 2.3 + 5); if (r < 0.22) continue;
+    const x = i * 130 - off + r * 50, s = 150 + r * 170, by = 660;
+    ctx.fillStyle = wc;
+    if (i % 3) {
+      ctx.fillRect(x - 7, by - s * 0.6, 14, s * 0.6);
+      ell(x, by - s * 0.78, s * 0.3, s * 0.27, wc); ell(x - s * 0.2, by - s * 0.58, s * 0.22, s * 0.2, wc); ell(x + s * 0.2, by - s * 0.6, s * 0.23, s * 0.2, wc);
+      ell(x + s * 0.08, by - s * 0.86, s * 0.13, s * 0.09, 'rgba(255,255,255,0.08)');
+    } else for (let k = 0; k < 3; k++) {
+      ctx.beginPath(); ctx.moveTo(x, by - s * (1 - k * 0.22)); ctx.lineTo(x + s * (0.16 + k * 0.07), by - s * (0.52 - k * 0.24));
+      ctx.lineTo(x - s * (0.16 + k * 0.07), by - s * (0.52 - k * 0.24)); ctx.fill();
+    }
+  }
+  ridge(cx * 0.8, 90, 668, 70, 21, true, pal('bush', p));
+}
+function drawCaveBack(cx) {
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#1a1430'); g.addColorStop(1, '#3a2a55');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ridge(cx * 0.5, 120, 780, 340, 31, false, '#2a2044');
+  for (let i = 0; i < 26; i++) { // светящиеся кристаллы
+    const x = ((hash(i + 70) * 1500 - (cx - area.x0) * 0.6) % 1500 + 1500) % 1500 - 100, y = 110 + hash(i + 90) * 480;
+    const a = 0.4 + 0.3 * Math.sin(game.frame * 0.04 + i);
+    ell(x, y, 14, 14, `rgba(120,220,255,${a * 0.25})`); ell(x, y, 3.5, 3.5, `rgba(190,245,255,${a + 0.3})`);
+  }
+}
+
+// ---------- 3. Тайлы ----------
+const BRICK_ROWS = [[2, 21, 25, 21], [2, 9, 13, 22, 37, 9], [2, 21, 25, 21]];
+function drawGround(tx, ty, x, y) {
+  const cave = tx >= CAVE_X, top = tileAt(tx, ty - 1) !== T.GROUND, n = hash(tx * 5.3 + ty * 9.1);
+  ctx.fillStyle = cave ? (top ? '#5a4a78' : '#463860') : (top ? '#a9673a' : '#93552e'); ctx.fillRect(x, y, TILE + 1, TILE + 1);
+  ell(x + 8 + n * 30, y + 16 + hash(n * 99) * 22, 4 + n * 4, 3 + n * 2, cave ? 'rgba(20,10,40,0.25)' : 'rgba(70,35,12,0.22)');
+  ell(x + 40 - n * 28, y + 38 - n * 8, 3, 2.2, cave ? 'rgba(180,160,230,0.18)' : 'rgba(255,214,160,0.25)');
+  if (!solidAt(tx - 1, ty)) { ctx.fillStyle = 'rgba(255,230,190,0.16)'; ctx.fillRect(x, y, 5, TILE); }
+  if (!solidAt(tx + 1, ty)) { ctx.fillStyle = 'rgba(40,15,5,0.25)'; ctx.fillRect(x + TILE - 6, y, 6, TILE); }
+  if (!top) return;
+  if (cave) { ctx.fillStyle = '#7a68a0'; ctx.fillRect(x, y, TILE + 1, 6); return; }
+  ctx.fillStyle = '#4fb53c'; ctx.beginPath(); ctx.moveTo(x, y - 2); ctx.lineTo(x + TILE + 1, y - 2); ctx.lineTo(x + TILE + 1, y + 11); // травяная шапка
+  for (let i = 3; i >= 0; i--) ctx.quadraticCurveTo(x + i * 12 + 6, y + 21 - (i % 2) * 5, x + i * 12, y + 11);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#86dd58'; ctx.fillRect(x, y - 2, TILE + 1, 5);
+  if (n > 0.55) { // цветочек
+    const fx = x + 8 + n * 28;
+    line(fx, y - 2, fx + 2, y - 12, '#3f9a34', 2); ell(fx + 2, y - 13, 4.2, 4.2, n > 0.8 ? '#ff7aa8' : '#fff6c8'); ell(fx + 2, y - 13, 1.7, 1.7, '#ffb020');
+  }
+}
+function drawBrick(x, y) {
+  fillRR(x, y, TILE, TILE, 6, '#8a3d1e');
+  BRICK_ROWS.forEach((r, i) => {
+    for (let k = 0; k < r.length; k += 2) {
+      fillRR(x + r[k], y + 2 + i * 15, r[k + 1], 13, 3, '#cf6a36');
+      ctx.fillStyle = 'rgba(255,220,170,0.35)'; ctx.fillRect(x + r[k] + 2, y + 3 + i * 15, r[k + 1] - 4, 3);
+    }
+  });
+}
+function drawQ(x, y, used) { // блок-сюрприз и пустой блок
+  const g = ctx.createLinearGradient(0, y, 0, y + TILE), edge = used ? '#6a4c38' : '#b86a08';
+  g.addColorStop(0, used ? '#b89878' : '#ffe066'); g.addColorStop(1, used ? '#8a6a50' : '#f0a020');
+  rr(x + 1, y + 1, 46, 46, 8); ctx.fillStyle = g; ctx.fill(); ctx.strokeStyle = edge; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.fillRect(x + 8, y + 4, 32, 3);
+  for (let i = 0; i < 4; i++) ell(x + 8 + (i % 2) * 32, y + 9 + (i >> 1) * 31, 2.5, 2.5, edge);
+  if (used) return;
+  const b = Math.sin(game.frame * 0.1) * 1.5;
+  ctx.font = 'bold 30px Verdana, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#a85a00'; ctx.fillText('?', x + 25.5, y + 27.5 + b); ctx.fillStyle = '#fffbe0'; ctx.fillText('?', x + 24, y + 26 + b);
+}
+function drawStone(x, y, n) {
+  fillRR(x, y, TILE, TILE, 7, '#6f7f96'); fillRR(x + 2, y + 2, 44, 42, 6, '#a3b4ca'); fillRR(x + 5, y + 5, 38, 37, 5, '#8c9db5');
+  ell(x + 14 + n * 20, y + 15 + hash(n * 77) * 14, 5, 3, 'rgba(255,255,255,0.22)');
+}
+function drawStump(x, y, top, n) { // полый пень шириной в два тайла, рисуется от левого
+  const g = ctx.createLinearGradient(x, 0, x + 96, 0);
+  g.addColorStop(0, '#6e4526'); g.addColorStop(0.3, '#a8703f'); g.addColorStop(0.6, '#8e5a30'); g.addColorStop(1, '#55321a');
+  ctx.fillStyle = g; ctx.fillRect(x + 4, y, 88, TILE + 1);
+  for (let i = 0; i < 4; i++) { const bx = x + 16 + i * 20 + hash(n + i) * 6; line(bx, y + 22, bx + 3, y + 42, 'rgba(50,25,10,0.3)', 2.5); }
+  if (!top) return;
+  fillRR(x - 2, y, 100, 18, 8, '#b98150'); ell(x + 48, y + 8, 40, 6.5, '#2c170c');
+  ctx.fillStyle = 'rgba(255,235,200,0.4)'; ctx.fillRect(x + 8, y + 1, 80, 2.5);
+  ell(x + 12, y + 18, 12, 4, '#58b848'); ell(x + 80, y + 19, 8, 3, '#58b848');
+}
+function drawTiles(ox) {
+  const tx0 = Math.max(0, Math.floor(ox / TILE) - 1), tx1 = Math.min(LW - 1, tx0 + Math.ceil(W / TILE) + 2);
+  for (let ty = 0; ty < ROWS; ty++) for (let tx = tx0; tx <= tx1; tx++) {
+    const t = tileAt(tx, ty); if (t === T.EMPTY || t === T.HIDDEN) continue;
+    const x = tx * TILE, y = ty * TILE + bumpOffset(tx, ty);
+    if (t === T.GROUND) drawGround(tx, ty, x, y);
+    else if (t === T.BRICK) drawBrick(x, y);
+    else if (t === T.Q || t === T.USED) drawQ(x, y, t === T.USED);
+    else if (t === T.STONE) drawStone(x, y, hash(tx + ty * 7));
+    else if (tileAt(tx - 1, ty) !== T.STUMP) drawStump(x, y, tileAt(tx, ty - 1) !== T.STUMP, tx + ty * 3);
+  }
+}
+
+// ---------- 4. Декорации: домик-гриб, шест с флагом, чекпоинт-фонарик ----------
+function drawDecor(p) {
+  const now = game.frame / 60, gy = flag.baseY + TILE, vis = (x, m) => x > cam.x - m && x < cam.x + W + m;
+  let x = flag.houseX + 80;
+  if (vis(x, 200)) {
+    fillRR(x - 62, gy - 120, 124, 126, 20, '#f1e2c4'); ctx.fillStyle = 'rgba(120,80,40,0.15)'; ctx.fillRect(x + 30, gy - 110, 28, 110);
+    ctx.beginPath(); ctx.ellipse(x, gy - 104, 96, 78, 0, Math.PI, 0); ctx.closePath(); ctx.fillStyle = '#d8452f'; ctx.fill();
+    ell(x - 46, gy - 138, 15, 11, '#fff3df'); ell(x + 10, gy - 158, 18, 12, '#fff3df'); ell(x + 58, gy - 128, 12, 9, '#fff3df');
+    fillRR(x - 46, gy - 64, 40, 64, 20, '#7a4a24'); ell(x - 14, gy - 30, 3, 3, '#ffd23e');
+    ell(x + 28, gy - 62, 26, 26, `rgba(255,220,120,${0.15 + p * 0.3})`); ell(x + 28, gy - 62, 14, 14, '#ffe9a0');
+    line(x + 28, gy - 76, x + 28, gy - 48, '#7a4a24', 2.5); line(x + 14, gy - 62, x + 42, gy - 62, '#7a4a24', 2.5);
+  }
+  x = flag.x;
+  if (vis(x, 150)) {
+    fillRR(x - 4, flag.topY - 26, 8, flag.baseY - flag.topY + 26, 4, '#ece8dc');
+    ctx.fillStyle = 'rgba(0,0,0,0.15)'; ctx.fillRect(x + 1, flag.topY - 22, 3, flag.baseY - flag.topY + 22);
+    ell(x, flag.topY - 30, 9, 9, '#ffd23e'); ell(x - 3, flag.topY - 33, 3, 3, '#fff6c0');
+    const fy = flagClothY(), wv = i => Math.sin(now * 5 + i * 0.9) * i;
+    ctx.beginPath(); ctx.moveTo(x - 4, fy);
+    for (let i = 1; i <= 4; i++) ctx.lineTo(x - 4 - i * 16, fy + i * 4.5 + wv(i));
+    for (let i = 3; i >= 0; i--) ctx.lineTo(x - 4 - i * 16, fy + 36 - i * 4.5 + wv(i));
+    ctx.closePath(); ctx.fillStyle = '#ff5a3c'; ctx.fill();
+    ell(x - 24, fy + 19 + wv(1.5), 6, 7, '#ffd23e'); ell(x - 24, fy + 15 + wv(1.5), 7, 4, '#b06a1e');
+  }
+  x = checkpoint.x;
+  if (vis(x, 100)) { // фонарик-жёлудь загорается при активации
+    const a = checkpoint.active, cy = checkpoint.y;
+    fillRR(x - 4, cy - 116, 8, 116, 3, '#8a5a34'); ctx.fillStyle = 'rgba(255,235,200,0.3)'; ctx.fillRect(x - 3, cy - 112, 2.5, 108);
+    if (a) ell(x, cy - 126, 34, 34, `rgba(255,200,80,${0.25 + 0.1 * Math.sin(now * 5)})`);
+    ell(x, cy - 124, 13, 15, a ? '#ffb52e' : '#9aa3ad'); ell(x - 4, cy - 124, 3, 6, 'rgba(255,255,255,0.5)');
+    ctx.beginPath(); ctx.ellipse(x, cy - 130, 14.5, 10, 0, Math.PI, 0); ctx.closePath(); ctx.fillStyle = a ? '#a8641c' : '#6c7580'; ctx.fill();
+    line(x, cy - 140, x + 1, cy - 146, '#5a3a1c', 3);
+  }
+}
+
+// ---------- 5. Лисёнок: дождевик с капюшоном, сапожки, хвост с белым кончиком ----------
+function drawFox(cx, footY, o) {
+  const pose = o.pose || 'idle', t = o.t || 0, ph = o.phase || 0, big = o.power > 0, fire = o.power === 2, sc = o.scale || 1;
+  const run = pose === 'run', up = pose === 'win' || pose === 'hurt', sw = run ? Math.sin(ph) : 0, by = pose === 'idle' ? Math.sin(t * 3) * 0.9 : 0;
+  const coat = o.star ? `hsl(${t * 600 % 360},95%,62%)` : fire ? '#fbfaf2' : '#ffd21f';
+  const coatD = o.star ? `hsl(${(t * 600 + 40) % 360},90%,45%)` : fire ? '#e23b2e' : '#e59a00';
+  const fur = '#f27d1e', furD = '#c4560f', cream = '#fff3df', ink = '#2a1a14', sq = Math.max(0, o.land || 0) * 1.4;
+  let sx = big ? 1 : 0.7, sy = big ? 1 : 0.52; // маленький — коренастый малыш
+  if (pose === 'crouch') { sx *= 1.12; sy *= big ? 0.52 : 0.78; }
+  ctx.save(); ctx.translate(cx, footY); ctx.scale((o.dir || 1) * sx * sc * (1 + sq), sy * sc * (1 - sq));
+  ctx.rotate(pose === 'skid' ? 0.18 : run ? 0.07 : pose === 'hurt' ? Math.sin(t * 12) * 0.25 : 0);
+  if (o.star) { ctx.shadowColor = coat; ctx.shadowBlur = 16; }
+  // хвост
+  const tailA = run ? -0.25 + sw * 0.2 : pose === 'jump' ? -0.6 : pose === 'fall' ? 0.5 : up ? Math.sin(t * 9) * 0.35 : Math.sin(t * 2.4) * 0.14;
+  ctx.save(); ctx.translate(-10, -24 + by); ctx.rotate(tailA);
+  ctx.beginPath(); ctx.moveTo(2, 6); ctx.bezierCurveTo(-18, 16, -42, 2, -37, -26); ctx.bezierCurveTo(-27, -18, -10, -12, 2, -6); ctx.closePath();
+  ctx.fillStyle = fur; ctx.fill(); ctx.clip(); ell(-38, -22, 14, 13, cream); ctx.restore();
+  // красные сапожки
+  const boot = (x, l) => { fillRR(x - 6, -14 - l, 16, 14, 5, '#e22b2b'); ctx.fillStyle = '#a81616'; ctx.fillRect(x - 5, -3 - l, 14, 3); ell(x + 5, -10 - l, 2.5, 1.8, 'rgba(255,255,255,0.6)'); };
+  if (run) { boot(-sw * 10 - 2, Math.max(0, -Math.cos(ph)) * 7); boot(sw * 10 - 2, Math.max(0, Math.cos(ph)) * 7); }
+  else if (pose === 'jump') { boot(-9, 5); boot(5, 11); } else if (pose === 'fall') { boot(-10, 2); boot(7, 5); }
+  else if (pose === 'skid') { boot(-2, 0); boot(10, 1); } else if (pose === 'climb') { boot(-4, 6); boot(4, 10); } else { boot(-8, 0); boot(5, 0); }
+  // лапы и дождевик
+  const armA = run ? sw * 0.9 : pose === 'jump' ? -2.5 : pose === 'fall' ? -1.9 : pose === 'skid' ? -1.1 : pose === 'climb' ? -1.5 : up ? -2.7 + Math.sin(t * 9) * 0.25 : 0.12;
+  const arm = a => {
+    ctx.save(); ctx.translate(1, -46 + by); ctx.rotate(a);
+    rr(-4.5, -3, 9, 17, 4.5); ctx.fillStyle = coat; ctx.fill(); ctx.strokeStyle = coatD; ctx.lineWidth = 1.5; ctx.stroke();
+    ell(0, 16, 4.6, 4.6, furD); ctx.restore();
+  };
+  arm(run || up ? -armA : armA * 0.7);
+  ctx.beginPath(); ctx.moveTo(-16, -13); ctx.quadraticCurveTo(-18, -44 + by, -9, -53 + by); ctx.lineTo(9, -53 + by);
+  ctx.quadraticCurveTo(18, -44 + by, 17, -13); ctx.quadraticCurveTo(0, -8, -16, -13); ctx.fillStyle = coat; ctx.fill();
+  ctx.strokeStyle = coatD; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(-14.5, -16); ctx.quadraticCurveTo(0, -11, 15.5, -16); ctx.stroke();
+  ell(-8, -34 + by, 3.5, 11, 'rgba(255,255,255,0.4)'); ell(7, -27 + by, 2.2, 2.2, coatD); ell(7, -37 + by, 2.2, 2.2, coatD);
+  fillRR(-10, -55 + by, 21, 6, 3, coatD);
+  // голова в капюшоне
+  const hy = -62 + by * 1.5;
+  ell(-1, hy - 1, 19.5, 19.5, coat);
+  ctx.strokeStyle = coatD; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(1, hy, 18, 2.0, 5.3); ctx.stroke();
+  for (const ex of [-7, 11]) { // уши торчат из капюшона
+    const k = ex < 0 ? -3 : 3;
+    ctx.beginPath(); ctx.moveTo(ex - 6, hy - 10); ctx.lineTo(ex + k, hy - 23); ctx.lineTo(ex + 7, hy - 10); ctx.fillStyle = fur; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(ex - 2, hy - 12); ctx.lineTo(ex + k * 0.8, hy - 19); ctx.lineTo(ex + 4, hy - 12); ctx.fillStyle = '#4a2a18'; ctx.fill();
+  }
+  ell(3, hy, 16.5, 15.5, fur); ell(7, hy + 6, 12, 7.5, cream); ell(14, hy + 3, 7, 5, cream); ell(19.5, hy + 1.5, 2.8, 2.4, ink);
+  if (pose === 'win') ell(12, hy + 8, 3, 2.5, '#a8322a');
+  const blink = pose === 'idle' && t % 3.4 < 0.13;
+  for (const ex of [4, 13]) { // глаза: обычные, моргание, радость, «крестики»
+    if (pose === 'hurt') { line(ex - 2.5, hy - 6, ex + 2.5, hy - 1, ink, 2); line(ex + 2.5, hy - 6, ex - 2.5, hy - 1, ink, 2); }
+    else if (up) { ctx.beginPath(); ctx.arc(ex, hy - 2.5, 3, Math.PI, 0); ctx.strokeStyle = ink; ctx.lineWidth = 2; ctx.stroke(); }
+    else if (blink) line(ex - 3, hy - 3, ex + 3, hy - 3, ink, 2);
+    else { ell(ex, hy - 3.5, 2.6, 3.6, ink); ell(ex + 0.8, hy - 4.8, 1, 1.2, '#fff'); }
+  }
+  arm(armA);
+  ctx.restore();
+}
+function drawHero() {
+  const h = hero, cx = h.x + h.w / 2;
+  if (h.inv > 0 && h.state === 'normal' && game.frame % 6 < 3) return; // мигание при неуязвимости
+  let pose = 'idle';
+  if (h.state === 'dead') pose = 'hurt'; else if (h.state === 'flag') pose = 'climb';
+  else if (h.state === 'win') pose = scene.phase > 0 ? 'win' : h.onGround ? 'run' : 'jump';
+  else if (h.state === 'pipe') pose = 'idle';
+  else if (h.inv > 1.7) pose = 'hurt'; else if (h.crouch) pose = 'crouch';
+  else if (!h.onGround) pose = h.vy < 0 ? 'jump' : 'fall'; else if (h.skid) pose = 'skid'; else if (Math.abs(h.vx) > 25) pose = 'run';
+  const pw = h.grow > 0 && Math.floor(h.grow * 16) % 2 ? h.growFrom : h.power; // мерцание при смене состояния
+  if (h.state === 'pipe') { ctx.save(); ctx.beginPath(); ctx.rect(h.x - 60, h.y - 200, 150, scene.pipe.clipY - h.y + 200); ctx.clip(); }
+  else if (h.ride) shadow(cx, h.ride.y + 3, 20, 0.24); else if (h.state !== 'dead') dropShadow(cx, h.y + h.h, 20);
+  drawFox(cx, h.y + h.h, { power: pw, dir: h.dir, pose, t: h.t, phase: h.runPhase, land: h.landT, star: h.star > 0 && (h.star > 2 || game.frame % 8 < 4) });
+  if (h.state === 'pipe') ctx.restore();
+}
+
+// ---------- 6. Враги ----------
+function drawEnemy(e) {
+  const cx = e.x + e.w / 2, t = e.t, ink = '#2a1c2e';
+  if (e.type === 'flower') { // хищный цветок (рисуется под тайлами, пень закрывает стебель)
+    if (e.rise < 0.03) return;
+    const hy = e.y + 20, m = 0.2 + 0.35 * Math.abs(Math.sin(t * 5));
+    line(cx, e.y + e.h, cx, hy + 6, '#3f9a34', 7); ell(cx - 11, e.y + 46, 10, 4.5, '#58b848'); ell(cx + 11, e.y + 42, 10, 4.5, '#58b848');
+    ctx.beginPath(); ctx.moveTo(cx, hy); ctx.arc(cx, hy, 19, -Math.PI / 2 + m, Math.PI * 1.5 - m); ctx.closePath(); ctx.fillStyle = '#e8345a'; ctx.fill();
+    line(cx, hy, cx + Math.sin(m) * 19, hy - Math.cos(m) * 19, '#fff', 3.5); line(cx, hy, cx - Math.sin(m) * 19, hy - Math.cos(m) * 19, '#fff', 3.5);
+    ell(cx - 10, hy + 6, 3.5, 3.5, '#ffd0dc'); ell(cx + 10, hy + 5, 3, 3, '#ffd0dc'); ell(cx, hy + 13, 3, 3, '#ffd0dc');
+    return;
+  }
+  if (e.onGround && e.state !== 'dead') shadow(cx, e.y + e.h + 2, 20, 0.2);
+  ctx.save(); ctx.translate(cx, e.y + e.h);
+  if (e.state === 'dead') { ctx.translate(0, -e.h / 2); ctx.scale(1, -1); ctx.translate(0, e.h / 2); } // сбитый — вверх тормашками
+  if (e.state === 'squash') ctx.scale(1.25, 0.3);
+  ctx.scale(e.dir, 1);
+  if (e.type === 'beetle') {
+    for (let i = -1; i <= 1; i++) line(i * 11, -9, i * 11 + Math.sin(t * 12 + i * 2.1) * 4, -1, ink, 4);
+    ctx.beginPath(); ctx.ellipse(-2, -8, 19, 27, 0, Math.PI, 0); ctx.closePath(); ctx.fillStyle = '#7d48c8'; ctx.fill();
+    line(-2, -33, -2, -10, '#5a2f9a', 2); ell(-10, -20, 3.5, 3.5, '#5a2f9a'); ell(5, -24, 3, 3, '#5a2f9a'); ell(-9, -28, 5, 3, 'rgba(255,255,255,0.4)');
+    ell(15, -13, 9, 9.5, '#3b2a55'); ell(17, -15, 4.2, 4.8, '#fff'); ell(18.5, -14.5, 2, 2.3, '#111');
+    line(12, -22, 21, -19, ink, 2.5); line(15, -22, 19, -31, ink, 2);
+  } else if (e.type === 'snail') {
+    const walk = e.state === 'walk' || e.state === 'dead', sx = walk ? -3 : 0, sy = walk ? -22 : -17, skin = '#f4cfa6';
+    if (walk) {
+      fillRR(-20, -11, 40, 11, 5.5, skin); ell(15, -15, 7.5, 9, skin);
+      for (const ex of [13, 20]) {
+        const tx = ex + (ex - 16) * 0.5;
+        line(ex, -21, tx, -32 + Math.sin(t * 5 + ex) * 1.5, skin, 3); ell(tx, -33, 3, 3, '#fff'); ell(tx + 0.8, -33, 1.4, 1.4, '#111');
+      }
+    } else { if (e.state === 'shell' && t > 5.5) ctx.translate(Math.sin(t * 40) * 1.5, 0); ell(0, -4, 12, 4, '#5a2a14'); }
+    ell(sx, sy, 17, 16.5, '#e8703a');
+    ctx.beginPath(); // спираль раковины (крутится, когда скользит)
+    for (let a = 0; a < 11; a += 0.5) { const q = a + (e.state === 'slide' ? t * 22 : 0); ctx.lineTo(sx + Math.cos(q) * a * 1.25, sy + Math.sin(q) * a * 1.25); }
+    ctx.strokeStyle = '#a03c18'; ctx.lineWidth = 2.5; ctx.stroke(); ell(sx - 6, sy - 9, 5, 3, 'rgba(255,255,255,0.4)');
+  } else { // ёж
+    for (let i = 0; i < 7; i++) {
+      const a = Math.PI * (1.02 + i * 0.15), c = Math.cos(a), s = Math.sin(a);
+      ctx.beginPath(); ctx.moveTo(-3 + c * 12 - s * 6, -14 + s * 10 + c * 6); ctx.lineTo(-3 + c * 27, -12 + s * 24); ctx.lineTo(-3 + c * 12 + s * 6, -14 + s * 10 - c * 6);
+      ctx.fillStyle = i % 2 ? '#4a2f22' : '#6a4630'; ctx.fill(); ell(-3 + c * 26, -12 + s * 23, 2.2, 2.2, '#ff6a4a');
+    }
+    ell(-2, -13, 19, 13, '#7a5236'); ell(12, -10, 10, 8.5, '#f3d9b5'); ell(21, -9, 2.8, 2.5, ink); ell(13, -13, 2.2, 2.8, ink); line(9, -18, 16, -16, ink, 2);
+    for (const fx of [-10, 6]) ell(fx + Math.sin(t * 10 + fx) * 2.5, -2, 5, 3, '#5a3a26');
+  }
+  ctx.restore();
+}
+
+// ---------- 7. Монеты, бонусы, огоньки, платформы ----------
+function drawCoin(x, y, r, w) {
+  const a = Math.abs(w);
+  ell(x, y, r * a + 1.5, r * 1.25, '#d88a0a'); ell(x, y, r * a * 0.78 + 0.6, r * 1.02, '#ffd23e');
+  if (a > 0.3) { ell(x, y, r * a * 0.3, r * 0.6, '#f2ae1a'); ell(x - r * a * 0.35, y - r * 0.5, r * a * 0.16, r * 0.3, '#fff8c8'); }
+}
+function drawItem(it) {
+  const cx = it.x + it.w / 2, cy = it.y + it.h / 2, t = it.t;
+  if (it.type === 'coin') { drawCoin(cx, cy + Math.sin(t * 2.5) * 2, 12, Math.cos(t * 4)); return; }
+  ctx.save(); ctx.translate(cx, cy);
+  if (it.type === 'acorn') { // золотой жёлудь катится
+    ell(0, 0, 22, 22, 'rgba(255,220,90,0.25)'); ctx.rotate(it.state === 'move' ? it.x * 0.035 : 0);
+    ell(0, 3, 13, 15, '#ffc02e'); ell(-4, 1, 3.5, 7, 'rgba(255,255,255,0.55)');
+    ctx.beginPath(); ctx.ellipse(0, -5, 15, 11, 0, Math.PI, 0); ctx.closePath(); ctx.fillStyle = '#b06a1e'; ctx.fill();
+    line(-9, -9, 9, -9, '#8a4e12', 1.5); line(0, -16, 2, -20, '#8a4e12', 3);
+  } else if (it.type === 'flower') { // огненный цветок
+    line(0, 18, 0, 0, '#3f9a34', 5); ell(-8, 12, 7, 3.5, '#58b848'); ell(8, 12, 7, 3.5, '#58b848');
+    for (let i = 0; i < 6; i++) { const a = i * TAU / 6 + t * 1.5; ell(Math.cos(a) * 9, -5 + Math.sin(a) * 9, 6.5, 6.5, i % 2 ? '#ff5a1f' : '#ffa51f'); }
+    ell(0, -5, 7, 7, '#fff3a0'); ell(-2.5, -6, 1.2, 2, '#5a2a10'); ell(2.5, -6, 1.2, 2, '#5a2a10');
+  } else if (it.type === 'star') {
+    ell(0, 0, 24, 24, `hsla(${t * 300 % 360},100%,70%,0.3)`);
+    starPath(0, 0, 19, 9, Math.sin(t * 6) * 0.2); ctx.fillStyle = '#ffe14a'; ctx.fill(); ctx.strokeStyle = '#e89a10'; ctx.lineWidth = 2; ctx.stroke();
+    ell(-4, 0, 1.6, 3, '#5a3a10'); ell(4, 0, 1.6, 3, '#5a3a10');
+  } else { // жизнь — сердечко с листиком
+    const s = 1 + Math.sin(t * 6) * 0.06; ctx.scale(s, s);
+    ctx.beginPath(); ctx.moveTo(0, 15); ctx.bezierCurveTo(-24, -2, -14, -20, 0, -7); ctx.bezierCurveTo(14, -20, 24, -2, 0, 15); ctx.fillStyle = '#ff4466'; ctx.fill();
+    ell(-7, -6, 3.5, 2.5, 'rgba(255,255,255,0.7)'); ell(5, -15, 6, 3, '#58b848');
+  }
+  ctx.restore();
+}
+function drawFireball(f) {
+  const x = f.x + 8, y = f.y + 8;
+  ell(x, y, 15, 15, 'rgba(255,120,30,0.3)');
+  ctx.save(); ctx.translate(x, y); ctx.rotate(f.t * 18); ell(0, 0, 9, 7.5, '#ff7a1f'); ell(2, 0, 5.5, 4.5, '#ffd23e'); ell(3, 0, 2.5, 2, '#fffbe0'); ctx.restore();
+}
+function drawPlatform(p) { // замшелое бревно
+  fillRR(p.x, p.y + 4, p.w, p.h, 9, '#6e4424'); fillRR(p.x, p.y, p.w, p.h - 3, 8, '#b07a45');
+  for (let i = 1; i < 3; i++) line(p.x + i * 48, p.y + 5, p.x + i * 48, p.y + 14, 'rgba(70,35,12,0.4)', 2);
+  fillRR(p.x + 5, p.y - 3, p.w - 10, 7, 3.5, '#62c248'); ctx.fillStyle = '#9be86a'; ctx.fillRect(p.x + 10, p.y - 2, p.w - 20, 2);
+  ell(p.x + 9, p.y + 10, 3, 3, '#f0d9b0'); ell(p.x + p.w - 9, p.y + 10, 3, 3, '#f0d9b0');
+}
+
+// ---------- 8. Частицы и всплывающие очки ----------
+function drawParticles(ox) {
+  for (const p of particles) {
+    if (p.x < ox - 40 || p.x > ox + W + 40) continue;
+    const k = p.life / p.max, s = p.size;
+    ctx.globalAlpha = p.type === 'firefly' ? Math.sin(k * Math.PI) : Math.min(1, (1 - k) * 2.5);
+    if (p.type === 'coinpop') drawCoin(p.x, p.y, 11, Math.cos(p.rot));
+    else if (p.type === 'shard' || p.type === 'leaf') {
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+      if (p.type === 'leaf') ell(0, 0, s * 0.9, s * 0.45, p.color);
+      else { fillRR(-s / 2, -s / 2, s, s * 0.8, 2, p.color); ctx.fillStyle = 'rgba(255,220,170,0.4)'; ctx.fillRect(-s / 2 + 1, -s / 2 + 1, s - 2, 2); }
+      ctx.restore();
+    } else if (p.type === 'dust') ell(p.x, p.y, s * (0.5 + k), s * (0.5 + k), p.color);
+    else if (p.type === 'firefly') { ell(p.x, p.y, s * 3, s * 3, 'rgba(255,250,150,0.25)'); ell(p.x, p.y, s * 0.6, s * 0.6, p.color); }
+    else ell(p.x, p.y, s * (1 - k * 0.6), s * (1 - k * 0.6), p.color); // spark, rainbow
+  }
+  ctx.globalAlpha = 1;
+}
+function drawFloatTexts() {
+  ctx.font = 'bold 22px Verdana, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineWidth = 4; ctx.lineJoin = 'round';
+  for (const f of floatTexts) {
+    ctx.globalAlpha = clamp(2 - f.t * 2, 0, 1);
+    ctx.strokeStyle = '#3a2410'; ctx.strokeText(f.text, f.x, f.y); ctx.fillStyle = f.text === '1UP' ? '#8dff6a' : '#fff6c8'; ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- 9. Свет и сборка кадра ----------
+function drawLighting(p, cave) {
+  if (p > 0.01) { // тёплый закатный тон поверх мира
+    ctx.globalCompositeOperation = 'multiply'; ctx.fillStyle = mixC([255, 255, 255], [255, 204, 182], p); ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  const v = ctx.createRadialGradient(W / 2, H / 2, 330, W / 2, H / 2, 800); // виньетка
+  v.addColorStop(0, 'rgba(10,8,30,0)'); v.addColorStop(1, `rgba(10,8,30,${cave ? 0.6 : 0.14 + p * 0.26})`);
+  ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+}
+function renderFrame() {
+  const cave = area.name === 'cave', p = lightLevel(), sh = game.shake;
+  const ox = Math.round(cam.x + (sh > 0.3 ? rnd(-sh, sh) : 0)), oy = sh > 0.3 ? Math.round(rnd(-sh, sh) * 0.6) : 0; // тряска камеры
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  if (cave) drawCaveBack(ox); else drawBackdrop(ox, p);
+  ctx.save(); ctx.translate(-ox, -oy);
+  if (!cave) drawDecor(p);
+  for (const e of enemies) if (e.type === 'flower' && onScreen(e, 60)) drawEnemy(e); // под тайлами: цветы в пнях
+  for (const it of items) if (it.state === 'rise') drawItem(it);                      // и бонусы, выезжающие из блоков
+  drawTiles(ox);
+  for (const pl of platforms) if (onScreen(pl, 20)) drawPlatform(pl);
+  for (const it of items) if (it.state !== 'rise' && onScreen(it, 40)) drawItem(it);
+  for (const e of enemies) if (e.type !== 'flower' && onScreen(e, 60)) drawEnemy(e);
+  drawHero();
+  for (const f of fireballs) drawFireball(f);
+  drawParticles(ox); drawFloatTexts();
+  ctx.restore();
+  if (!cave) ridge(ox * 1.3, 24, H + 8, 56, 9, false, mixC([24, 96, 58], [48, 30, 62], p)); // трава переднего плана
+  drawLighting(p, cave);
+  if (game.fade > 0) { ctx.fillStyle = `rgba(12,10,24,${game.fade})`; ctx.fillRect(0, 0, W, H); } // плавный переход
+  if (typeof drawUI === 'function') drawUI(); // часть 4: HUD, экраны, сенсорные кнопки
+}
+
+// ================= ЧАСТЬ 4: ИНТЕРФЕЙС, ЗВУК, МУЗЫКА, ЗАПУСК =================
+// Демо-бот в эту сокращённую часть не входит: ?demo=1 и 8 секунд ожидания в меню пока ничего не делают.
+// Чтобы добавить его позже, достаточно объявить botInput(input) и вызвать newGame(true).
+
+// ---------- 1. Звук: Web Audio, синтез ----------
+let actx = null, master = null, noiseBuf = null, musNext = 0, musStep = 0;
+function initAudio() { // контекст создаётся по первому действию игрока
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    actx = new AC(); master = actx.createGain(); master.gain.value = game.muted ? 0 : 0.5; master.connect(actx.destination);
+    noiseBuf = actx.createBuffer(1, Math.floor(actx.sampleRate * 0.3), actx.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { actx = null; }
+}
+function env(vol, t0, dur) { // огибающая громкости
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.0001, t0); g.gain.linearRampToValueAtTime(vol, t0 + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  g.connect(master); return g;
+}
+function tone(f, dur, type, vol, delay, slide) {
+  if (!actx || game.muted) return;
+  const t0 = actx.currentTime + (delay || 0), o = actx.createOscillator();
+  o.type = type || 'square'; o.frequency.setValueAtTime(f, t0);
+  if (slide) o.frequency.exponentialRampToValueAtTime(slide, t0 + dur);
+  o.connect(env(vol, t0, dur)); o.start(t0); o.stop(t0 + dur + 0.03);
+}
+function noise(dur, vol, delay) {
+  if (!actx || game.muted || !noiseBuf) return;
+  const t0 = actx.currentTime + (delay || 0), s = actx.createBufferSource();
+  s.buffer = noiseBuf; s.connect(env(vol, t0, dur)); s.start(t0); s.stop(t0 + dur + 0.03);
+}
+const seq = (ns, d, type, vol) => ns.forEach((f, i) => { if (f) tone(f, d * 1.5, type, vol, i * d); });
+const SFX = {
+  jump: () => tone(300, 0.17, 'square', 0.1, 0, 640),
+  bump: () => tone(150, 0.1, 'square', 0.14, 0, 80),
+  break: () => { noise(0.2, 0.25); tone(120, 0.16, 'sawtooth', 0.1, 0, 50); },
+  coin: () => { tone(988, 0.08, 'square', 0.09); tone(1319, 0.28, 'square', 0.09, 0.07); },
+  sprout: () => seq([262, 330, 392, 523, 659], 0.05, 'square', 0.09),
+  power: () => seq([392, 523, 659, 494, 659, 784, 587, 784, 988], 0.055, 'square', 0.1),
+  star: () => seq([659, 784, 988, 1319, 988, 1319, 1568], 0.06, 'triangle', 0.16),
+  life: () => seq([659, 784, 1319, 1047, 1175, 1568], 0.09, 'square', 0.1),
+  stomp: () => tone(440, 0.11, 'square', 0.13, 0, 150),
+  kick: () => tone(560, 0.08, 'square', 0.12, 0, 240),
+  fire: () => tone(760, 0.1, 'sawtooth', 0.08, 0, 180),
+  pipe: () => seq([220, 165, 123, 220, 165, 123], 0.1, 'sawtooth', 0.09),
+  checkpoint: () => seq([523, 659, 784, 1047], 0.08, 'triangle', 0.16),
+  flag: () => tone(280, 0.9, 'square', 0.09, 0, 1200),
+  win: () => seq([523, 659, 784, 1047, 0, 784, 1047, 1319, 1568], 0.11, 'square', 0.11),
+  tick: () => tone(1500, 0.03, 'square', 0.04),
+  hurt: () => tone(420, 0.3, 'sawtooth', 0.13, 0, 90),
+  die: () => seq([494, 466, 440, 392, 330, 262, 196], 0.11, 'square', 0.11)
+};
+function playSfx(name) {
+  const f = SFX[name];
+  if (f && actx && !game.muted) { try { f(); } catch (e) { /* звук не критичен */ } }
+}
+function applyMute() { if (master) master.gain.value = game.muted ? 0 : 0.5; }
+
+// ---------- 2. Музыка: мелодия + бас + «хэт», планировщик с упреждением ----------
+const MEL = [72, 0, 76, 79, 0, 76, 79, 0, 81, 0, 79, 76, 0, 72, 74, 0, 77, 0, 76, 74, 0, 72, 74, 76, 79, 0, 0, 76, 74, 72, 0, 0,
+  72, 0, 76, 79, 0, 76, 79, 0, 84, 0, 83, 81, 0, 79, 81, 0, 77, 79, 81, 0, 79, 77, 76, 0, 74, 0, 79, 0, 72, 0, 0, 0];
+const BASS = [48, 45, 41, 43, 48, 45, 41, 43];
+const midi = m => 440 * Math.pow(2, (m - 69) / 12);
+function updateMusic() {
+  if (!actx || game.muted) return;
+  const on = game.mode === 'play' && (hero.state === 'normal' || hero.state === 'pipe');
+  if (!on) { musNext = 0; if (game.mode !== 'pause') musStep = 0; return; }
+  const now = actx.currentTime, tr = area.name === 'cave' ? -5 : 0;
+  const d = hero.star > 0 ? 0.1 : game.time < 50 ? 0.125 : 0.155; // звезда и нехватка времени ускоряют темп
+  if (musNext < now) musNext = now + 0.05;
+  try {
+    while (musNext < now + 0.25) {
+      const i = musStep % 64, m = MEL[i], dl = musNext - now, root = i >= 60 ? 48 : BASS[i >> 3];
+      if (m) tone(midi(m + tr), d * 1.7, 'square', 0.045, dl);
+      if (i % 2 === 0) tone(midi(root + (i % 4 ? 7 : 0) + tr), d * 1.8, 'triangle', 0.11, dl);
+      else noise(0.03, 0.03, dl);
+      musNext += d; musStep++;
+    }
+  } catch (e) { musNext = 0; }
+}
+
+// ---------- 3. Управление экранами ----------
+function onAnyKey(code) { // true = нажатие поглощено экраном
+  initAudio();
+  if (code === 'KeyM' || /^(F\d+|Meta|Control|Alt|Tab|OS)/.test(code)) return false;
+  const m = game.mode, ptr = code === 'Touch' || code === 'Mouse';
+  if (m === 'menu') { if (game.modeT > 0.3) newGame(false); return true; }
+  if (m === 'over' || m === 'win') {
+    if (code === 'KeyR') return false; // R — сразу новая игра (обрабатывает часть 1)
+    if (game.modeT > 0.8) { game.checkpoint = false; game.demo = false; resetLevel(false); setMode('menu'); }
+    return true;
+  }
+  if (m === 'pause' && ptr) { setMode('play'); return true; }
+  return false;
+}
+function updateMeta(dt) {
+  if (game.mode !== 'play' && game.mode !== 'pause') hero.t += dt; // герой «дышит» на экранах
+  updateMusic();
+}
+
+// ---------- 4. Помощники интерфейса ----------
+function txt(s, x, y, size, fill, align, stroke) {
+  ctx.font = `bold ${size}px Verdana, sans-serif`; ctx.textAlign = align || 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(3, size * 0.16); ctx.strokeStyle = stroke || '#2a1a3a'; ctx.strokeText(s, x, y);
+  ctx.fillStyle = fill; ctx.fillText(s, x, y);
+}
+function tri(x, y, r, a) {
+  ctx.beginPath();
+  for (let i = 0; i < 3; i++) ctx.lineTo(x + Math.cos(a + i * TAU / 3) * r, y + Math.sin(a + i * TAU / 3) * r);
+  ctx.closePath(); ctx.fill();
+}
+function dim(a) { ctx.fillStyle = `rgba(14,10,34,${a})`; ctx.fillRect(0, 0, W, H); }
+const fmtScore = n => String(Math.round(n)).padStart(6, '0');
+
+// ---------- 5. HUD: жизни, монеты, очки, время ----------
+function drawHUD(now) {
+  const pill = (x, w) => fillRR(x, 18, w, 48, 24, 'rgba(20,16,44,0.45)');
+  pill(24, 150); drawFox(60, 61, { power: 0, pose: 'idle', t: now, scale: 0.8 });
+  txt('× ' + game.lives, 88, 43, 26, '#fff', 'left');
+  pill(190, 150); drawCoin(224, 42, 11, Math.cos(now * 4));
+  txt('× ' + String(game.coins).padStart(2, '0'), 248, 43, 26, '#ffe680', 'left');
+  pill(530, 220); txt(fmtScore(game.score), 640, 43, 30, '#fff');
+  const low = game.mode === 'play' && game.time < 50 && Math.floor(now * 4) % 2;
+  pill(1066, 150); ell(1098, 42, 14, 14, '#fff'); ell(1098, 42, 11, 11, '#3a2a5a'); // часы
+  line(1098, 42, 1098, 34, '#fff', 2.5); line(1098, 42, 1104, 45, '#fff', 2.5);
+  txt(String(Math.ceil(game.time)).padStart(3, '0'), 1122, 43, 28, low ? '#ff6a5a' : '#fff', 'left');
+  if (hero.star > 0) { // полоска звезды
+    fillRR(540, 74, 200, 10, 5, 'rgba(20,16,44,0.45)');
+    fillRR(540, 74, Math.max(10, 200 * hero.star / 10), 10, 5, `hsl(${game.frame * 6 % 360},100%,65%)`);
+  }
+  if (game.muted) txt('звук выключен (M)', 640, hero.star > 0 ? 104 : 86, 16, '#d8d0f0');
+}
+
+// ---------- 6. Экраны: меню, пауза, проигрыш, победа ----------
+function drawMenu(now, a) {
+  dim(0.36);
+  ctx.globalAlpha = a;
+  const g = ctx.createLinearGradient(0, 110, 0, 220); g.addColorStop(0, '#fff6b0'); g.addColorStop(1, '#ff8a1f');
+  txt('ЛИСЁНОК', 640, 165 + Math.sin(now * 2) * 4, 104, g, 'center', '#3a1a10');
+  txt('и огненный жёлудь', 640, 262, 50, '#ffe9c0', 'center', '#3a1a10');
+  const ax = 1010, ay = 172 + Math.sin(now * 2 + 1) * 5, fl = 1 + Math.sin(now * 14) * 0.12; // огненный жёлудь
+  ell(ax, ay - 30, 30 * fl, 40 * fl, 'rgba(255,120,30,0.3)'); ell(ax, ay - 30, 17, 28 * fl, '#ff7a1f'); ell(ax, ay - 22, 10, 17 * fl, '#ffd23e');
+  ell(ax, ay + 10, 22, 26, '#ffc02e'); ell(ax - 7, ay + 6, 5, 11, 'rgba(255,255,255,0.55)');
+  ctx.beginPath(); ctx.ellipse(ax, ay - 4, 25, 18, 0, Math.PI, 0); ctx.closePath(); ctx.fillStyle = '#b06a1e'; ctx.fill();
+  if (game.hiscore > 0) txt('Рекорд: ' + fmtScore(game.hiscore), 640, 52, 24, '#ffe680');
+  shadow(750, 627, 62, 0.3); // лисёнок бежит на месте и показывает три состояния
+  drawFox(750, 624, { power: Math.floor(now / 2.5) % 3, pose: 'run', t: now, phase: now * 11, scale: 1.9, dir: 1 });
+  ctx.globalAlpha = a * (0.55 + 0.45 * Math.sin(now * 5));
+  txt('Нажми любую клавишу или коснись экрана', 640, 348, 30, '#fff');
+  ctx.globalAlpha = a;
+  txt('← → / A D — бег   ·   Пробел / W / ↑ — прыжок   ·   Shift — ускорение', 640, 658, 20, '#fff6e0');
+  txt('X / F — огонёк   ·   ↓ — присесть и спуск в пень   ·   P — пауза   ·   M — звук   ·   R — рестарт', 640, 692, 20, '#fff6e0');
+}
+function drawPause(now, a) {
+  dim(0.55 * a); ctx.globalAlpha = a;
+  txt('ПАУЗА', 640, 300, 96, '#fff6b0', 'center', '#3a1a10');
+  drawFox(640, 480, { power: hero.power, pose: 'idle', t: now, scale: 1.5 });
+  txt(isTouch ? 'Коснись экрана, чтобы продолжить' : 'P — продолжить   ·   R — начать заново   ·   M — звук', 640, 550, 26, '#fff');
+}
+function drawOver(now, a) {
+  dim(0.72 * a); ctx.globalAlpha = a;
+  txt('ИГРА ОКОНЧЕНА', 640, 210, 84, '#ff7a6a', 'center', '#3a1010');
+  drawFox(640, 400, { power: 0, pose: 'hurt', t: now * 0.4, scale: 2 });
+  txt('Очки: ' + fmtScore(game.score), 640, 470, 38, '#fff');
+  const rec = game.score > 0 && game.score >= game.hiscore;
+  txt(rec ? 'Новый рекорд!' : 'Рекорд: ' + fmtScore(game.hiscore), 640, 524, 28, rec ? `hsl(${now * 200 % 360},100%,72%)` : '#ffe680');
+  if (game.modeT > 0.8) {
+    ctx.globalAlpha = 0.55 + 0.45 * Math.sin(now * 5);
+    txt(isTouch ? 'Коснись экрана' : 'Любая клавиша — в меню   ·   R — ещё раз', 640, 610, 26, '#fff');
+  }
+}
+function drawWin(now, a) {
+  dim(0.4 * a); ctx.globalAlpha = a;
+  const py = 120 + (1 - a) * 40; // панель мягко выезжает
+  fillRR(300, py, 680, 480, 34, 'rgba(24,18,52,0.88)');
+  rr(300, py, 680, 480, 34); ctx.strokeStyle = '#ffd23e'; ctx.lineWidth = 4; ctx.stroke();
+  const g = ctx.createLinearGradient(0, py + 30, 0, py + 110); g.addColorStop(0, '#fff6b0'); g.addColorStop(1, '#ffa01f');
+  txt('ПОБЕДА!', 640, py + 72, 72, g, 'center', '#3a1a10');
+  const row = (label, val, y, c) => { txt(label, 350, y, 24, '#cfc6f0', 'left'); txt(val, 770, y, 26, c || '#fff', 'right'); };
+  row('Бонус за флаг', '+' + Math.round(game.flagBonus), py + 160);
+  row('Бонус за время', '+' + Math.round(game.timeBonus), py + 206);
+  row('Монеты', '× ' + game.coins, py + 252, '#ffe680');
+  line(350, py + 284, 770, py + 284, 'rgba(255,255,255,0.3)', 2);
+  row('Итого очков', fmtScore(game.score), py + 318, '#fff6b0');
+  row('Рекорд', fmtScore(game.hiscore), py + 364, '#ffe680');
+  if (game.newRecord) {
+    starPath(372, py + 412, 16, 7, now * 2); ctx.fillStyle = '#ffe14a'; ctx.fill();
+    txt('НОВЫЙ РЕКОРД!', 400, py + 412, 28, `hsl(${now * 200 % 360},100%,72%)`, 'left');
+  }
+  shadow(872, py + 392, 44, 0.35);
+  drawFox(872, py + 390, { power: hero.power, pose: 'win', t: now, scale: 1.5 });
+  if (game.modeT > 0.8) {
+    ctx.globalAlpha = 0.55 + 0.45 * Math.sin(now * 5);
+    txt(isTouch ? 'Коснись экрана' : 'Любая клавиша — в меню   ·   R — ещё раз', 640, py + 448, 22, '#fff');
+  }
+}
+
+// ---------- 7. Сенсорные кнопки ----------
+function drawTouch() {
+  const ANG = { left: Math.PI, right: 0, down: Math.PI / 2, jump: -Math.PI / 2 };
+  for (const b of touchBtns) {
+    ctx.globalAlpha = b.on ? 0.6 : 0.3; ell(b.x, b.y, b.r, b.r, '#1a1438');
+    ctx.globalAlpha = b.on ? 0.95 : 0.6;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU); ctx.stroke();
+    ctx.fillStyle = '#fff';
+    if (b.id === 'pause') { ctx.fillRect(b.x - 9, b.y - 11, 6, 22); ctx.fillRect(b.x + 3, b.y - 11, 6, 22); }
+    else if (b.id === 'fire') { ell(b.x, b.y, 18, 18, '#ff7a1f'); ell(b.x + 3, b.y, 10, 10, '#ffe14a'); }
+    else tri(b.x, b.y, b.r * 0.45, ANG[b.id]);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- 8. Сборка интерфейса (вызывается в конце renderFrame) ----------
+function drawUI() {
+  const now = game.frame / 60, m = game.mode, a = Math.min(1, game.modeT * 3); // плавное появление экранов
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  if (m !== 'menu') drawHUD(now);
+  if (m === 'menu') drawMenu(now, a);
+  else if (m === 'pause') drawPause(now, a);
+  else if (m === 'over') drawOver(now, a);
+  else if (m === 'win') drawWin(now, a);
+  ctx.globalAlpha = 1;
+  if (isTouch && m === 'play') drawTouch();
+}
+
+// ---------- 9. Запуск ----------
+requestAnimationFrame(loop);
+</script></body></html>
